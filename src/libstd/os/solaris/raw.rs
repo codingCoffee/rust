@@ -1,13 +1,3 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Solaris-specific raw type definitions
 
 #![stable(feature = "raw_ext", since = "1.1.0")]
@@ -18,8 +8,8 @@
                               definitions")]
 #![allow(deprecated)]
 
-use os::raw::c_long;
-use os::unix::raw::{uid_t, gid_t};
+use crate::os::raw::c_long;
+use crate::os::unix::raw::{uid_t, gid_t};
 
 #[stable(feature = "raw_ext", since = "1.1.0")] pub type blkcnt_t = u64;
 #[stable(feature = "raw_ext", since = "1.1.0")] pub type blksize_t = u64;
@@ -32,7 +22,7 @@ use os::unix::raw::{uid_t, gid_t};
 #[stable(feature = "raw_ext", since = "1.1.0")] pub type time_t = i64;
 
 #[stable(feature = "pthread_t", since = "1.8.0")]
-pub type pthread_t = usize;
+pub type pthread_t = u32;
 
 #[repr(C)]
 #[derive(Clone)]

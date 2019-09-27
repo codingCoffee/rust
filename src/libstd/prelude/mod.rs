@@ -1,13 +1,3 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! The Rust Prelude.
 //!
 //! Rust comes with a variety of things in its standard library. However, if
@@ -22,13 +12,15 @@
 //!
 //! On a technical level, Rust inserts
 //!
-//! ```ignore
+//! ```
+//! # #[allow(unused_extern_crates)]
 //! extern crate std;
 //! ```
 //!
 //! into the crate root of every crate, and
 //!
-//! ```ignore
+//! ```
+//! # #[allow(unused_imports)]
 //! use std::prelude::v1::*;
 //! ```
 //!
@@ -50,20 +42,20 @@
 //! # Prelude contents
 //!
 //! The current version of the prelude (version 1) lives in
-//! [`std::prelude::v1`], and reexports the following.
+//! [`std::prelude::v1`], and re-exports the following.
 //!
-//! * [`std::marker`]::{[`Copy`], [`Send`], [`Sized`], [`Sync`]}. The marker
-//!   traits indicate fundamental properties of types.
+//! * [`std::marker`]::{[`Copy`], [`Send`], [`Sized`], [`Sync`], [`Unpin`]}. The
+//!   marker traits indicate fundamental properties of types.
 //! * [`std::ops`]::{[`Drop`], [`Fn`], [`FnMut`], [`FnOnce`]}. Various
 //!   operations for both destructors and overloading `()`.
-//! * [`std::mem`]::[`drop`], a convenience function for explicitly dropping a
-//!   value.
+//! * [`std::mem`]::[`drop`][`mem::drop`], a convenience function for explicitly
+//!   dropping a value.
 //! * [`std::boxed`]::[`Box`], a way to allocate values on the heap.
 //! * [`std::borrow`]::[`ToOwned`], The conversion trait that defines
-//!   [`to_owned()`], the generic method for creating an owned type from a
+//!   [`to_owned`], the generic method for creating an owned type from a
 //!   borrowed type.
-//! * [`std::clone`]::[`Clone`], the ubiquitous trait that defines [`clone()`],
-//!   the method for producing a copy of a value.
+//! * [`std::clone`]::[`Clone`], the ubiquitous trait that defines
+//!   [`clone`][`Clone::clone`], the method for producing a copy of a value.
 //! * [`std::cmp`]::{[`PartialEq`], [`PartialOrd`], [`Eq`], [`Ord`] }. The
 //!   comparison traits, which implement the comparison operators and are often
 //!   seen in trait bounds.
@@ -79,9 +71,6 @@
 //! * [`std::result`]::[`Result`]::{`self`, `Ok`, `Err`}. A type for functions
 //!   that may succeed or fail. Like [`Option`], its variants are exported as
 //!   well.
-//! * [`std::slice`]::[`SliceConcatExt`], a trait that exists for technical
-//!   reasons, but shouldn't have to exist. It provides a few useful methods on
-//!   slices.
 //! * [`std::string`]::{[`String`], [`ToString`]}, heap allocated strings.
 //! * [`std::vec`]::[`Vec`](../vec/struct.Vec.html), a growable, heap-allocated
 //!   vector.
@@ -116,9 +105,10 @@
 //! [`Sync`]: ../marker/trait.Sync.html
 //! [`ToOwned`]: ../borrow/trait.ToOwned.html
 //! [`ToString`]: ../string/trait.ToString.html
+//! [`Unpin`]: ../marker/trait.Unpin.html
 //! [`Vec`]: ../vec/struct.Vec.html
-//! [`clone()`]: ../clone/trait.Clone.html#tymethod.clone
-//! [`drop`]: ../mem/fn.drop.html
+//! [`Clone::clone`]: ../clone/trait.Clone.html#tymethod.clone
+//! [`mem::drop`]: ../mem/fn.drop.html
 //! [`std::borrow`]: ../borrow/index.html
 //! [`std::boxed`]: ../boxed/index.html
 //! [`std::clone`]: ../clone/index.html
@@ -135,11 +125,11 @@
 //! [`std::slice`]: ../slice/index.html
 //! [`std::string`]: ../string/index.html
 //! [`std::vec`]: ../vec/index.html
-//! [`to_owned()`]: ../borrow/trait.ToOwned.html#tymethod.to_owned
-//! [book-closures]: ../../book/closures.html
-//! [book-dtor]: ../../book/drop.html
-//! [book-enums]: ../../book/enums.html
-//! [book-iter]: ../../book/iterators.html
+//! [`to_owned`]: ../borrow/trait.ToOwned.html#tymethod.to_owned
+//! [book-closures]: ../../book/ch13-01-closures.html
+//! [book-dtor]: ../../book/ch15-03-drop.html
+//! [book-enums]: ../../book/ch06-01-defining-an-enum.html
+//! [book-iter]: ../../book/ch13-02-iterators.html
 
 #![stable(feature = "rust1", since = "1.0.0")]
 

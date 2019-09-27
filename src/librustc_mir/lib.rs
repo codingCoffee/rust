@@ -1,55 +1,64 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 /*!
 
 Rust MIR: a lowered representation of Rust. Also: an experiment!
 
 */
 
-#![crate_name = "rustc_mir"]
-#![crate_type = "rlib"]
-#![crate_type = "dylib"]
-#![deny(warnings)]
-#![unstable(feature = "rustc_private", issue = "27812")]
-
-#![feature(associated_consts)]
+#![feature(nll)]
+#![feature(in_band_lifetimes)]
+#![feature(inner_deref)]
+#![feature(slice_patterns)]
 #![feature(box_patterns)]
-#![feature(rustc_diagnostic_macros)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
+#![feature(box_syntax)]
+#![feature(crate_visibility_modifier)]
+#![feature(core_intrinsics)]
+#![feature(const_fn)]
+#![feature(decl_macro)]
+#![feature(exhaustive_patterns)]
+#![feature(never_type)]
+#![feature(specialization)]
+#![feature(try_trait)]
+#![feature(unicode_internals)]
+#![feature(slice_concat_ext)]
+#![feature(trusted_len)]
+#![feature(try_blocks)]
+#![feature(mem_take)]
+#![feature(associated_type_bounds)]
+#![feature(range_is_empty)]
+
+#![recursion_limit="256"]
 
 #[macro_use] extern crate log;
-extern crate graphviz as dot;
-#[macro_use]
-extern crate rustc;
-extern crate rustc_data_structures;
-extern crate rustc_back;
-#[macro_use]
-#[no_link]
-extern crate rustc_bitflags;
-#[macro_use]
-extern crate syntax;
-extern crate syntax_pos;
-extern crate rustc_const_math;
-extern crate rustc_const_eval;
+#[macro_use] extern crate rustc;
+#[macro_use] extern crate rustc_data_structures;
+#[macro_use] extern crate syntax;
 
-extern crate rustc_i128;
+pub mod error_codes;
 
-pub mod diagnostics;
-
-pub mod build;
-pub mod def_use;
-pub mod graphviz;
+mod borrow_check;
+mod build;
+pub mod dataflow;
 mod hair;
-pub mod mir_map;
-pub mod pretty;
+mod lints;
+mod shim;
 pub mod transform;
+pub mod util;
+pub mod interpret;
+pub mod monomorphize;
+pub mod const_eval;
 
+use rustc::ty::query::Providers;
+
+pub fn provide(providers: &mut Providers<'_>) {
+    borrow_check::provide(providers);
+    shim::provide(providers);
+    transform::provide(providers);
+    monomorphize::partitioning::provide(providers);
+    providers.const_eval = const_eval::const_eval_provider;
+    providers.const_eval_raw = const_eval::const_eval_raw_provider;
+    providers.check_match = hair::pattern::check_match;
+    providers.const_field = |tcx, param_env_and_value| {
+        let (param_env, (value, field)) = param_env_and_value.into_parts();
+        const_eval::const_field(tcx, param_env, None, field, value)
+    };
+}

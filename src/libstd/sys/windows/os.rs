@@ -1,29 +1,18 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+//! Implementation of `std::os` functionality for Windows.
 
-//! Implementation of `std::os` functionality for Windows
+#![allow(nonstandard_style)]
 
-#![allow(bad_style)]
+use crate::os::windows::prelude::*;
 
-use os::windows::prelude::*;
-
-use error::Error as StdError;
-use ffi::{OsString, OsStr};
-use fmt;
-use io;
-use os::windows::ffi::EncodeWide;
-use path::{self, PathBuf};
-use ptr;
-use slice;
-use sys::{c, cvt};
-use sys::handle::Handle;
+use crate::error::Error as StdError;
+use crate::ffi::{OsString, OsStr};
+use crate::fmt;
+use crate::io;
+use crate::os::windows::ffi::EncodeWide;
+use crate::path::{self, PathBuf};
+use crate::ptr;
+use crate::slice;
+use crate::sys::{c, cvt};
 
 use super::to_u16s;
 
@@ -32,7 +21,7 @@ pub fn errno() -> i32 {
 }
 
 /// Gets a detailed string description for the given error number.
-pub fn error_string(errnum: i32) -> String {
+pub fn error_string(mut errnum: i32) -> String {
     // This value is calculated from the macro
     // MAKELANGID(LANG_SYSTEM_DEFAULT, SUBLANG_SYS_DEFAULT)
     let langId = 0x0800 as c::DWORD;
@@ -40,16 +29,34 @@ pub fn error_string(errnum: i32) -> String {
     let mut buf = [0 as c::WCHAR; 2048];
 
     unsafe {
-        let res = c::FormatMessageW(c::FORMAT_MESSAGE_FROM_SYSTEM |
+        let mut module = ptr::null_mut();
+        let mut flags = 0;
+
+        // NTSTATUS errors may be encoded as HRESULT, which may returned from
+        // GetLastError. For more information about Windows error codes, see
+        // `[MS-ERREF]`: https://msdn.microsoft.com/en-us/library/cc231198.aspx
+        if (errnum & c::FACILITY_NT_BIT as i32) != 0 {
+            // format according to https://support.microsoft.com/en-us/help/259693
+            const NTDLL_DLL: &[u16] = &['N' as _, 'T' as _, 'D' as _, 'L' as _, 'L' as _,
+                                        '.' as _, 'D' as _, 'L' as _, 'L' as _, 0];
+            module = c::GetModuleHandleW(NTDLL_DLL.as_ptr());
+
+            if module != ptr::null_mut() {
+                errnum ^= c::FACILITY_NT_BIT as i32;
+                flags = c::FORMAT_MESSAGE_FROM_HMODULE;
+            }
+        }
+
+        let res = c::FormatMessageW(flags | c::FORMAT_MESSAGE_FROM_SYSTEM |
                                         c::FORMAT_MESSAGE_IGNORE_INSERTS,
-                                    ptr::null_mut(),
+                                    module,
                                     errnum as c::DWORD,
                                     langId,
                                     buf.as_mut_ptr(),
                                     buf.len() as c::DWORD,
                                     ptr::null()) as usize;
         if res == 0 {
-            // Sometimes FormatMessageW can fail e.g. system doesn't like langId,
+            // Sometimes FormatMessageW can fail e.g., system doesn't like langId,
             let fm_err = errno();
             return format!("OS Error {} (FormatMessageW() returned error {})",
                            errnum, fm_err);
@@ -58,7 +65,7 @@ pub fn error_string(errnum: i32) -> String {
         match String::from_utf16(&buf[..res]) {
             Ok(mut msg) => {
                 // Trim trailing CRLF inserted by FormatMessageW
-                let len = msg.trim_right().len();
+                let len = msg.trim_end().len();
                 msg.truncate(len);
                 msg
             },
@@ -128,7 +135,7 @@ pub struct SplitPaths<'a> {
     must_yield: bool,
 }
 
-pub fn split_paths(unparsed: &OsStr) -> SplitPaths {
+pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
     SplitPaths {
         data: unparsed.encode_wide(),
         must_yield: true,
@@ -204,7 +211,7 @@ pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
 }
 
 impl fmt::Display for JoinPathsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "path segment contains `\"`".fmt(f)
     }
 }
@@ -276,10 +283,11 @@ pub fn temp_dir() -> PathBuf {
     }, super::os2path).unwrap()
 }
 
-pub fn home_dir() -> Option<PathBuf> {
-    ::env::var_os("HOME").or_else(|| {
-        ::env::var_os("USERPROFILE")
-    }).map(PathBuf::from).or_else(|| unsafe {
+#[cfg(not(target_vendor = "uwp"))]
+fn home_dir_crt() -> Option<PathBuf> {
+    unsafe {
+        use crate::sys::handle::Handle;
+
         let me = c::GetCurrentProcess();
         let mut token = ptr::null_mut();
         if c::OpenProcessToken(me, c::TOKEN_READ, &mut token) == 0 {
@@ -293,9 +301,38 @@ pub fn home_dir() -> Option<PathBuf> {
                 _ => sz - 1, // sz includes the null terminator
             }
         }, super::os2path).ok()
-    })
+    }
+}
+
+#[cfg(target_vendor = "uwp")]
+fn home_dir_crt() -> Option<PathBuf> {
+    None
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    crate::env::var_os("HOME").or_else(|| {
+        crate::env::var_os("USERPROFILE")
+    }).map(PathBuf::from).or_else(|| home_dir_crt())
 }
 
 pub fn exit(code: i32) -> ! {
     unsafe { c::ExitProcess(code as c::UINT) }
+}
+
+pub fn getpid() -> u32 {
+    unsafe { c::GetCurrentProcessId() as u32 }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::io::Error;
+    use crate::sys::c;
+
+    // tests `error_string` above
+    #[test]
+    fn ntstatus_error() {
+        const STATUS_UNSUCCESSFUL: u32 = 0xc000_0001;
+        assert!(!Error::from_raw_os_error((STATUS_UNSUCCESSFUL | c::FACILITY_NT_BIT) as _)
+            .to_string().contains("FormatMessageW() returned error"));
+    }
 }

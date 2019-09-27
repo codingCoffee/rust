@@ -1,49 +1,50 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Implementation of `std::os` functionality for unix systems
 
 #![allow(unused_imports)] // lots of cfg code here
 
-use os::unix::prelude::*;
+use crate::os::unix::prelude::*;
 
-use error::Error as StdError;
-use ffi::{CString, CStr, OsString, OsStr};
-use fmt;
-use io;
-use iter;
-use libc::{self, c_int, c_char, c_void};
-use marker::PhantomData;
-use mem;
-use memchr;
-use path::{self, PathBuf};
-use ptr;
-use slice;
-use str;
-use sys_common::mutex::Mutex;
-use sys::cvt;
-use sys::fd;
-use vec;
+use crate::error::Error as StdError;
+use crate::ffi::{CString, CStr, OsString, OsStr};
+use crate::fmt;
+use crate::io;
+use crate::iter;
+use crate::marker::PhantomData;
+use crate::mem;
+use crate::memchr;
+use crate::path::{self, PathBuf};
+use crate::ptr;
+use crate::slice;
+use crate::str;
+use crate::sys_common::mutex::{Mutex, MutexGuard};
+use crate::sys::cvt;
+use crate::sys::fd;
+use crate::vec;
+
+use libc::{c_int, c_char, c_void};
 
 const TMPBUF_SZ: usize = 128;
-static ENV_LOCK: Mutex = Mutex::new();
 
+cfg_if::cfg_if! {
+    if #[cfg(target_os = "redox")] {
+        const PATH_SEPARATOR: u8 = b';';
+    } else {
+        const PATH_SEPARATOR: u8 = b':';
+    }
+}
 
 extern {
     #[cfg(not(target_os = "dragonfly"))]
-    #[cfg_attr(any(target_os = "linux", target_os = "emscripten", target_os = "fuchsia"),
+    #[cfg_attr(any(target_os = "linux",
+                   target_os = "emscripten",
+                   target_os = "fuchsia",
+                   target_os = "l4re"),
                link_name = "__errno_location")]
-    #[cfg_attr(any(target_os = "bitrig",
-                   target_os = "netbsd",
+    #[cfg_attr(any(target_os = "netbsd",
                    target_os = "openbsd",
                    target_os = "android",
+                   target_os = "hermit",
+                   target_os = "redox",
                    target_env = "newlib"),
                link_name = "__errno")]
     #[cfg_attr(target_os = "solaris", link_name = "___errno")]
@@ -64,7 +65,8 @@ pub fn errno() -> i32 {
 }
 
 /// Sets the platform-specific value of errno
-#[cfg(target_os = "solaris")] // only needed for readdir so far
+#[cfg(all(not(target_os = "linux"),
+          not(target_os = "dragonfly")))] // needed for readdir and syscall!
 pub fn set_errno(e: i32) {
     unsafe {
         *errno_location() = e as c_int
@@ -79,6 +81,18 @@ pub fn errno() -> i32 {
     }
 
     unsafe { errno as i32 }
+}
+
+#[cfg(target_os = "dragonfly")]
+pub fn set_errno(e: i32) {
+    extern {
+        #[thread_local]
+        static mut errno: c_int;
+    }
+
+    unsafe {
+        errno = e;
+    }
 }
 
 /// Gets a detailed string description for the given error number.
@@ -145,14 +159,14 @@ pub struct SplitPaths<'a> {
                     fn(&'a [u8]) -> PathBuf>,
 }
 
-pub fn split_paths(unparsed: &OsStr) -> SplitPaths {
+pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
     fn bytes_to_path(b: &[u8]) -> PathBuf {
         PathBuf::from(<OsStr as OsStrExt>::from_bytes(b))
     }
-    fn is_colon(b: &u8) -> bool { *b == b':' }
+    fn is_separator(b: &u8) -> bool { *b == PATH_SEPARATOR }
     let unparsed = unparsed.as_bytes();
     SplitPaths {
-        iter: unparsed.split(is_colon as fn(&u8) -> bool)
+        iter: unparsed.split(is_separator as fn(&u8) -> bool)
                       .map(bytes_to_path as fn(&[u8]) -> PathBuf)
     }
 }
@@ -170,12 +184,11 @@ pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
     where I: Iterator<Item=T>, T: AsRef<OsStr>
 {
     let mut joined = Vec::new();
-    let sep = b':';
 
     for (i, path) in paths.enumerate() {
         let path = path.as_ref().as_bytes();
-        if i > 0 { joined.push(sep) }
-        if path.contains(&sep) {
+        if i > 0 { joined.push(PATH_SEPARATOR) }
+        if path.contains(&PATH_SEPARATOR) {
             return Err(JoinPathsError)
         }
         joined.extend_from_slice(path);
@@ -184,8 +197,8 @@ pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
 }
 
 impl fmt::Display for JoinPathsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        "path segment contains separator `:`".fmt(f)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "path segment contains separator `{}`", PATH_SEPARATOR)
     }
 }
 
@@ -201,13 +214,13 @@ pub fn current_exe() -> io::Result<PathBuf> {
                        libc::KERN_PROC_PATHNAME as c_int,
                        -1 as c_int];
         let mut sz = 0;
-        cvt(libc::sysctl(mib.as_mut_ptr(), mib.len() as ::libc::c_uint,
+        cvt(libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint,
                          ptr::null_mut(), &mut sz, ptr::null_mut(), 0))?;
         if sz == 0 {
             return Err(io::Error::last_os_error())
         }
         let mut v: Vec<u8> = Vec::with_capacity(sz);
-        cvt(libc::sysctl(mib.as_mut_ptr(), mib.len() as ::libc::c_uint,
+        cvt(libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint,
                          v.as_mut_ptr() as *mut libc::c_void, &mut sz,
                          ptr::null_mut(), 0))?;
         if sz == 0 {
@@ -220,10 +233,37 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(target_os = "netbsd")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    ::fs::read_link("/proc/curproc/exe")
+    fn sysctl() -> io::Result<PathBuf> {
+        unsafe {
+            let mib = [libc::CTL_KERN, libc::KERN_PROC_ARGS, -1, libc::KERN_PROC_PATHNAME];
+            let mut path_len: usize = 0;
+            cvt(libc::sysctl(mib.as_ptr(), mib.len() as libc::c_uint,
+                             ptr::null_mut(), &mut path_len,
+                             ptr::null(), 0))?;
+            if path_len <= 1 {
+                return Err(io::Error::new(io::ErrorKind::Other,
+                           "KERN_PROC_PATHNAME sysctl returned zero-length string"))
+            }
+            let mut path: Vec<u8> = Vec::with_capacity(path_len);
+            cvt(libc::sysctl(mib.as_ptr(), mib.len() as libc::c_uint,
+                             path.as_ptr() as *mut libc::c_void, &mut path_len,
+                             ptr::null(), 0))?;
+            path.set_len(path_len - 1); // chop off NUL
+            Ok(PathBuf::from(OsString::from_vec(path)))
+        }
+    }
+    fn procfs() -> io::Result<PathBuf> {
+        let curproc_exe = path::Path::new("/proc/curproc/exe");
+        if curproc_exe.is_file() {
+            return crate::fs::read_link(curproc_exe);
+        }
+        Err(io::Error::new(io::ErrorKind::Other,
+                           "/proc/curproc/exe doesn't point to regular file."))
+    }
+    sysctl().or_else(|_| procfs())
 }
 
-#[cfg(any(target_os = "bitrig", target_os = "openbsd"))]
+#[cfg(target_os = "openbsd")]
 pub fn current_exe() -> io::Result<PathBuf> {
     unsafe {
         let mut mib = [libc::CTL_KERN,
@@ -244,7 +284,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
         }
         let argv0 = CStr::from_ptr(argv[0]).to_bytes();
         if argv0[0] == b'.' || argv0.iter().any(|b| *b == b'/') {
-            ::fs::canonicalize(OsStr::from_bytes(argv0))
+            crate::fs::canonicalize(OsStr::from_bytes(argv0))
         } else {
             Ok(PathBuf::from(OsStr::from_bytes(argv0)))
         }
@@ -253,7 +293,15 @@ pub fn current_exe() -> io::Result<PathBuf> {
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "emscripten"))]
 pub fn current_exe() -> io::Result<PathBuf> {
-    ::fs::read_link("/proc/self/exe")
+    match crate::fs::read_link("/proc/self/exe") {
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "no /proc/self/exe available. Is /proc mounted?"
+            ))
+        },
+        other => other,
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -332,7 +380,7 @@ pub fn current_exe() -> io::Result<PathBuf> {
         let result = _get_next_image_info(0, &mut cookie, &mut info,
             mem::size_of::<image_info>() as i32);
         if result != 0 {
-            use io::ErrorKind;
+            use crate::io::ErrorKind;
             Err(io::Error::new(ErrorKind::Other, "Error getting executable path"))
         } else {
             let name = CStr::from_ptr(info.name.as_ptr()).to_bytes();
@@ -341,10 +389,15 @@ pub fn current_exe() -> io::Result<PathBuf> {
     }
 }
 
-#[cfg(target_os = "fuchsia")]
+#[cfg(target_os = "redox")]
 pub fn current_exe() -> io::Result<PathBuf> {
-    use io::ErrorKind;
-    Err(io::Error::new(ErrorKind::Other, "Not yet implemented on fuchsia"))
+    crate::fs::read_to_string("sys:exe").map(PathBuf::from)
+}
+
+#[cfg(any(target_os = "fuchsia", target_os = "l4re", target_os = "hermit"))]
+pub fn current_exe() -> io::Result<PathBuf> {
+    use crate::io::ErrorKind;
+    Err(io::Error::new(ErrorKind::Other, "Not yet implemented!"))
 }
 
 pub struct Env {
@@ -370,30 +423,30 @@ pub unsafe fn environ() -> *mut *const *const c_char {
     &mut environ
 }
 
+pub unsafe fn env_lock() -> MutexGuard<'static> {
+    // We never call `ENV_LOCK.init()`, so it is UB to attempt to
+    // acquire this mutex reentrantly!
+    static ENV_LOCK: Mutex = Mutex::new();
+    ENV_LOCK.lock()
+}
+
 /// Returns a vector of (variable, value) byte-vector pairs for all the
 /// environment variables of the current process.
 pub fn env() -> Env {
     unsafe {
-        ENV_LOCK.lock();
+        let _guard = env_lock();
         let mut environ = *environ();
-        if environ == ptr::null() {
-            ENV_LOCK.unlock();
-            panic!("os::env() failure getting env string from OS: {}",
-                   io::Error::last_os_error());
-        }
         let mut result = Vec::new();
-        while *environ != ptr::null() {
+        while environ != ptr::null() && *environ != ptr::null() {
             if let Some(key_value) = parse(CStr::from_ptr(*environ).to_bytes()) {
                 result.push(key_value);
             }
             environ = environ.offset(1);
         }
-        let ret = Env {
+        return Env {
             iter: result.into_iter(),
             _dont_send_or_sync_me: PhantomData,
-        };
-        ENV_LOCK.unlock();
-        return ret
+        }
     }
 
     fn parse(input: &[u8]) -> Option<(OsString, OsString)> {
@@ -417,15 +470,14 @@ pub fn getenv(k: &OsStr) -> io::Result<Option<OsString>> {
     // always None as well
     let k = CString::new(k.as_bytes())?;
     unsafe {
-        ENV_LOCK.lock();
-        let s = libc::getenv(k.as_ptr()) as *const _;
+        let _guard = env_lock();
+        let s = libc::getenv(k.as_ptr()) as *const libc::c_char;
         let ret = if s.is_null() {
             None
         } else {
             Some(OsStringExt::from_vec(CStr::from_ptr(s).to_bytes().to_vec()))
         };
-        ENV_LOCK.unlock();
-        return Ok(ret)
+        Ok(ret)
     }
 }
 
@@ -434,10 +486,8 @@ pub fn setenv(k: &OsStr, v: &OsStr) -> io::Result<()> {
     let v = CString::new(v.as_bytes())?;
 
     unsafe {
-        ENV_LOCK.lock();
-        let ret = cvt(libc::setenv(k.as_ptr(), v.as_ptr(), 1)).map(|_| ());
-        ENV_LOCK.unlock();
-        return ret
+        let _guard = env_lock();
+        cvt(libc::setenv(k.as_ptr(), v.as_ptr(), 1)).map(|_| ())
     }
 }
 
@@ -445,10 +495,8 @@ pub fn unsetenv(n: &OsStr) -> io::Result<()> {
     let nbuf = CString::new(n.as_bytes())?;
 
     unsafe {
-        ENV_LOCK.lock();
-        let ret = cvt(libc::unsetenv(nbuf.as_ptr())).map(|_| ());
-        ENV_LOCK.unlock();
-        return ret
+        let _guard = env_lock();
+        cvt(libc::unsetenv(nbuf.as_ptr())).map(|_| ())
     }
 }
 
@@ -459,7 +507,7 @@ pub fn page_size() -> usize {
 }
 
 pub fn temp_dir() -> PathBuf {
-    ::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
+    crate::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| {
         if cfg!(target_os = "android") {
             PathBuf::from("/data/local/tmp")
         } else {
@@ -469,59 +517,106 @@ pub fn temp_dir() -> PathBuf {
 }
 
 pub fn home_dir() -> Option<PathBuf> {
-    return ::env::var_os("HOME").or_else(|| unsafe {
+    return crate::env::var_os("HOME").or_else(|| unsafe {
         fallback()
     }).map(PathBuf::from);
 
     #[cfg(any(target_os = "android",
               target_os = "ios",
-              target_os = "nacl",
-              target_os = "emscripten"))]
+              target_os = "emscripten",
+              target_os = "redox"))]
     unsafe fn fallback() -> Option<OsString> { None }
     #[cfg(not(any(target_os = "android",
                   target_os = "ios",
-                  target_os = "nacl",
-                  target_os = "emscripten")))]
+                  target_os = "emscripten",
+                  target_os = "redox")))]
     unsafe fn fallback() -> Option<OsString> {
-        #[cfg(not(target_os = "solaris"))]
-        unsafe fn getpwduid_r(me: libc::uid_t, passwd: &mut libc::passwd,
-                              buf: &mut Vec<c_char>) -> Option<()> {
-            let mut result = ptr::null_mut();
-            match libc::getpwuid_r(me, passwd, buf.as_mut_ptr(),
-                                   buf.capacity(),
-                                   &mut result) {
-                0 if !result.is_null() => Some(()),
-                _ => None
-            }
-        }
-
-        #[cfg(target_os = "solaris")]
-        unsafe fn getpwduid_r(me: libc::uid_t, passwd: &mut libc::passwd,
-                              buf: &mut Vec<c_char>) -> Option<()> {
-            // getpwuid_r semantics is different on Illumos/Solaris:
-            // http://illumos.org/man/3c/getpwuid_r
-            let result = libc::getpwuid_r(me, passwd, buf.as_mut_ptr(),
-                                          buf.capacity());
-            if result.is_null() { None } else { Some(()) }
-        }
-
         let amt = match libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) {
             n if n < 0 => 512 as usize,
             n => n as usize,
         };
         let mut buf = Vec::with_capacity(amt);
         let mut passwd: libc::passwd = mem::zeroed();
-
-        if getpwduid_r(libc::getuid(), &mut passwd, &mut buf).is_some() {
-            let ptr = passwd.pw_dir as *const _;
-            let bytes = CStr::from_ptr(ptr).to_bytes().to_vec();
-            Some(OsStringExt::from_vec(bytes))
-        } else {
-            None
+        let mut result = ptr::null_mut();
+        match libc::getpwuid_r(libc::getuid(), &mut passwd, buf.as_mut_ptr(),
+                               buf.capacity(), &mut result) {
+            0 if !result.is_null() => {
+                let ptr = passwd.pw_dir as *const _;
+                let bytes = CStr::from_ptr(ptr).to_bytes().to_vec();
+                Some(OsStringExt::from_vec(bytes))
+            },
+            _ => None,
         }
     }
 }
 
 pub fn exit(code: i32) -> ! {
     unsafe { libc::exit(code as c_int) }
+}
+
+pub fn getpid() -> u32 {
+    unsafe { libc::getpid() as u32 }
+}
+
+pub fn getppid() -> u32 {
+    unsafe { libc::getppid() as u32 }
+}
+
+#[cfg(target_env = "gnu")]
+pub fn glibc_version() -> Option<(usize, usize)> {
+    if let Some(Ok(version_str)) = glibc_version_cstr().map(CStr::to_str) {
+        parse_glibc_version(version_str)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_env = "gnu")]
+fn glibc_version_cstr() -> Option<&'static CStr> {
+    weak! {
+        fn gnu_get_libc_version() -> *const libc::c_char
+    }
+    if let Some(f) = gnu_get_libc_version.get() {
+        unsafe { Some(CStr::from_ptr(f())) }
+    } else {
+        None
+    }
+}
+
+// Returns Some((major, minor)) if the string is a valid "x.y" version,
+// ignoring any extra dot-separated parts. Otherwise return None.
+#[cfg(target_env = "gnu")]
+fn parse_glibc_version(version: &str) -> Option<(usize, usize)> {
+    let mut parsed_ints = version.split('.').map(str::parse::<usize>).fuse();
+    match (parsed_ints.next(), parsed_ints.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => Some((major, minor)),
+        _ => None
+    }
+}
+
+#[cfg(all(test, target_env = "gnu"))]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_glibc_version() {
+        // This mostly just tests that the weak linkage doesn't panic wildly...
+        glibc_version();
+    }
+
+    #[test]
+    fn test_parse_glibc_version() {
+        let cases = [
+            ("0.0", Some((0, 0))),
+            ("01.+2", Some((1, 2))),
+            ("3.4.5.six", Some((3, 4))),
+            ("1", None),
+            ("1.-2", None),
+            ("1.foo", None),
+            ("foo.1", None),
+        ];
+        for &(version_str, parsed) in cases.iter() {
+            assert_eq!(parsed, parse_glibc_version(version_str));
+        }
+    }
 }

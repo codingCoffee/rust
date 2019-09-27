@@ -1,13 +1,3 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Panic support for libcore
 //!
 //! The core library cannot define panicking, but it does *declare* panicking. This
@@ -15,8 +5,10 @@
 //! useful an upstream crate must define panicking for libcore to use. The current
 //! interface for panicking is:
 //!
-//! ```ignore
-//! fn panic_impl(fmt: fmt::Arguments, &(&'static str, u32)) -> !;
+//! ```
+//! # use std::fmt;
+//! fn panic_impl(fmt: fmt::Arguments, file_line_col: &(&'static str, u32, u32)) -> !
+//! # { loop {} }
 //! ```
 //!
 //! This definition allows for panicking with any general message, but it does not
@@ -34,37 +26,60 @@
                       and related macros",
             issue = "0")]
 
-use fmt;
+use crate::fmt;
+use crate::panic::{Location, PanicInfo};
 
-#[cold] #[inline(never)] // this is the slow path, always
+#[cold]
+// never inline unless panic_immediate_abort to avoid code
+// bloat at the call sites as much as possible
+#[cfg_attr(not(feature="panic_immediate_abort"),inline(never))]
 #[lang = "panic"]
-pub fn panic(expr_file_line: &(&'static str, &'static str, u32)) -> ! {
+pub fn panic(expr_file_line_col: &(&'static str, &'static str, u32, u32)) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        unsafe { super::intrinsics::abort() }
+    }
+
     // Use Arguments::new_v1 instead of format_args!("{}", expr) to potentially
     // reduce size overhead. The format_args! macro uses str's Display trait to
     // write expr, which calls Formatter::pad, which must accommodate string
     // truncation and padding (even though none is used here). Using
     // Arguments::new_v1 may allow the compiler to omit Formatter::pad from the
     // output binary, saving up to a few kilobytes.
-    let (expr, file, line) = *expr_file_line;
-    panic_fmt(fmt::Arguments::new_v1(&[expr], &[]), &(file, line))
+    let (expr, file, line, col) = *expr_file_line_col;
+    panic_fmt(fmt::Arguments::new_v1(&[expr], &[]), &(file, line, col))
 }
 
-#[cold] #[inline(never)]
+#[cold]
+#[cfg_attr(not(feature="panic_immediate_abort"),inline(never))]
 #[lang = "panic_bounds_check"]
-fn panic_bounds_check(file_line: &(&'static str, u32),
+fn panic_bounds_check(file_line_col: &(&'static str, u32, u32),
                      index: usize, len: usize) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        unsafe { super::intrinsics::abort() }
+    }
+
     panic_fmt(format_args!("index out of bounds: the len is {} but the index is {}",
-                           len, index), file_line)
+                           len, index), file_line_col)
 }
 
-#[cold] #[inline(never)]
-pub fn panic_fmt(fmt: fmt::Arguments, file_line: &(&'static str, u32)) -> ! {
-    #[allow(improper_ctypes)]
-    extern {
-        #[lang = "panic_fmt"]
-        #[unwind]
-        fn panic_impl(fmt: fmt::Arguments, file: &'static str, line: u32) -> !;
+#[cold]
+#[cfg_attr(not(feature="panic_immediate_abort"),inline(never))]
+#[cfg_attr(    feature="panic_immediate_abort" ,inline)]
+pub fn panic_fmt(fmt: fmt::Arguments<'_>, file_line_col: &(&'static str, u32, u32)) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        unsafe { super::intrinsics::abort() }
     }
-    let (file, line) = *file_line;
-    unsafe { panic_impl(fmt, file, line) }
+
+    // NOTE This function never crosses the FFI boundary; it's a Rust-to-Rust call
+    extern "Rust" {
+        #[lang = "panic_impl"]
+        fn panic_impl(pi: &PanicInfo<'_>) -> !;
+    }
+
+    let (file, line, col) = *file_line_col;
+    let pi = PanicInfo::internal_constructor(
+        Some(&fmt),
+        Location::internal_constructor(file, line, col),
+    );
+    unsafe { panic_impl(&pi) }
 }

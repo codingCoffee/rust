@@ -1,54 +1,78 @@
-// Copyright 2012-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+use crate::hir::def::{Res, DefKind};
+use crate::hir::def_id::DefId;
+use crate::ty::{self, Ty, TyCtxt};
+use crate::ty::layout::{LayoutError, Pointer, SizeSkeleton, VariantIdx};
+use crate::ty::query::Providers;
 
-use dep_graph::DepNode;
-use hir::def::Def;
-use hir::def_id::DefId;
-use infer::InferCtxt;
-use traits::Reveal;
-use ty::{self, Ty, TyCtxt};
-use ty::layout::{LayoutError, Pointer, SizeSkeleton};
+use rustc_target::spec::abi::Abi::RustIntrinsic;
+use rustc_data_structures::indexed_vec::Idx;
+use syntax_pos::{Span, sym};
+use crate::hir::intravisit::{self, Visitor, NestedVisitorMap};
+use crate::hir;
 
-use syntax::abi::Abi::RustIntrinsic;
-use syntax::ast;
-use syntax_pos::Span;
-use hir::intravisit::{self, Visitor, NestedVisitorMap};
-use hir;
+fn check_mod_intrinsics(tcx: TyCtxt<'_>, module_def_id: DefId) {
+    tcx.hir().visit_item_likes_in_module(
+        module_def_id,
+        &mut ItemVisitor { tcx }.as_deep_visitor()
+    );
+}
 
-pub fn check_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let mut visitor = ItemVisitor {
-        tcx: tcx
+pub fn provide(providers: &mut Providers<'_>) {
+    *providers = Providers {
+        check_mod_intrinsics,
+        ..*providers
     };
-    tcx.visit_all_item_likes_in_krate(DepNode::IntrinsicCheck, &mut visitor.as_deep_visitor());
 }
 
-struct ItemVisitor<'a, 'tcx: 'a> {
-    tcx: TyCtxt<'a, 'tcx, 'tcx>
+struct ItemVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
 }
 
-struct ExprVisitor<'a, 'gcx: 'a+'tcx, 'tcx: 'a> {
-    infcx: &'a InferCtxt<'a, 'gcx, 'tcx>
+struct ExprVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    tables: &'tcx ty::TypeckTables<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
 }
 
-impl<'a, 'gcx, 'tcx> ExprVisitor<'a, 'gcx, 'tcx> {
-    fn def_id_is_transmute(&self, def_id: DefId) -> bool {
-        let intrinsic = match self.infcx.tcx.item_type(def_id).sty {
-            ty::TyFnDef(.., ref bfty) => bfty.abi == RustIntrinsic,
-            _ => return false
-        };
-        intrinsic && self.infcx.tcx.item_name(def_id) == "transmute"
+/// If the type is `Option<T>`, it will return `T`, otherwise
+/// the type itself. Works on most `Option`-like types.
+fn unpack_option_like<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
+    let (def, substs) = match ty.kind {
+        ty::Adt(def, substs) => (def, substs),
+        _ => return ty
+    };
+
+    if def.variants.len() == 2 && !def.repr.c() && def.repr.int.is_none() {
+        let data_idx;
+
+        let one = VariantIdx::new(1);
+        let zero = VariantIdx::new(0);
+
+        if def.variants[zero].fields.is_empty() {
+            data_idx = one;
+        } else if def.variants[one].fields.is_empty() {
+            data_idx = zero;
+        } else {
+            return ty;
+        }
+
+        if def.variants[data_idx].fields.len() == 1 {
+            return def.variants[data_idx].fields[0].ty(tcx, substs);
+        }
     }
 
-    fn check_transmute(&self, span: Span, from: Ty<'gcx>, to: Ty<'gcx>, id: ast::NodeId) {
-        let sk_from = SizeSkeleton::compute(from, self.infcx);
-        let sk_to = SizeSkeleton::compute(to, self.infcx);
+    ty
+}
+
+impl ExprVisitor<'tcx> {
+    fn def_id_is_transmute(&self, def_id: DefId) -> bool {
+        self.tcx.fn_sig(def_id).abi() == RustIntrinsic &&
+        self.tcx.item_name(def_id) == sym::transmute
+    }
+
+    fn check_transmute(&self, span: Span, from: Ty<'tcx>, to: Ty<'tcx>) {
+        let sk_from = SizeSkeleton::compute(from, self.tcx, self.param_env);
+        let sk_to = SizeSkeleton::compute(to, self.tcx, self.param_env);
 
         // Check for same size using the skeletons.
         if let (Ok(sk_from), Ok(sk_to)) = (sk_from, sk_to) {
@@ -56,33 +80,34 @@ impl<'a, 'gcx, 'tcx> ExprVisitor<'a, 'gcx, 'tcx> {
                 return;
             }
 
-            match (&from.sty, sk_to) {
-                (&ty::TyFnDef(..), SizeSkeleton::Known(size_to))
-                        if size_to == Pointer.size(&self.infcx.tcx.data_layout) => {
-                    // FIXME #19925 Remove this warning after a release cycle.
-                    let msg = format!("`{}` is now zero-sized and has to be cast \
-                                       to a pointer before transmuting to `{}`",
-                                      from, to);
-                    self.infcx.tcx.sess.add_lint(
-                        ::lint::builtin::TRANSMUTE_FROM_FN_ITEM_TYPES, id, span, msg);
+            // Special-case transmutting from `typeof(function)` and
+            // `Option<typeof(function)>` to present a clearer error.
+            let from = unpack_option_like(self.tcx.global_tcx(), from);
+            if let (&ty::FnDef(..), SizeSkeleton::Known(size_to)) = (&from.kind, sk_to) {
+                if size_to == Pointer.size(&self.tcx) {
+                    struct_span_err!(self.tcx.sess, span, E0591,
+                                     "can't transmute zero-sized type")
+                        .note(&format!("source type: {}", from))
+                        .note(&format!("target type: {}", to))
+                        .help("cast with `as` to a pointer instead")
+                        .emit();
                     return;
                 }
-                _ => {}
             }
         }
 
         // Try to display a sensible error with as much information as possible.
-        let skeleton_string = |ty: Ty<'gcx>, sk| {
+        let skeleton_string = |ty: Ty<'tcx>, sk| {
             match sk {
                 Ok(SizeSkeleton::Known(size)) => {
                     format!("{} bits", size.bits())
                 }
                 Ok(SizeSkeleton::Pointer { tail, .. }) => {
-                    format!("pointer to {}", tail)
+                    format!("pointer to `{}`", tail)
                 }
                 Err(LayoutError::Unknown(bad)) => {
                     if bad == ty {
-                        format!("size can vary")
+                        "this type does not have a fixed size".to_owned()
                     } else {
                         format!("size can vary because of {}", bad)
                     }
@@ -91,63 +116,53 @@ impl<'a, 'gcx, 'tcx> ExprVisitor<'a, 'gcx, 'tcx> {
             }
         };
 
-        struct_span_err!(self.infcx.tcx.sess, span, E0512,
-                  "transmute called with differently sized types: \
-                   {} ({}) to {} ({})",
-                  from, skeleton_string(from, sk_from),
-                  to, skeleton_string(to, sk_to))
-            .span_label(span,
-                &format!("transmuting between {} and {}",
-                    skeleton_string(from, sk_from),
-                    skeleton_string(to, sk_to)))
-            .emit();
+        let mut err = struct_span_err!(self.tcx.sess, span, E0512,
+                                       "cannot transmute between types of different sizes, \
+                                        or dependently-sized types");
+        if from == to {
+            err.note(&format!("`{}` does not have a fixed size", from));
+        } else {
+            err.note(&format!("source type: `{}` ({})", from, skeleton_string(from, sk_from)))
+                .note(&format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
+        }
+        err.emit()
     }
 }
 
-impl<'a, 'tcx> Visitor<'tcx> for ItemVisitor<'a, 'tcx> {
+impl Visitor<'tcx> for ItemVisitor<'tcx> {
     fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
         NestedVisitorMap::None
     }
 
     fn visit_nested_body(&mut self, body_id: hir::BodyId) {
-        let body = self.tcx.map.body(body_id);
-        self.tcx.infer_ctxt(body_id, Reveal::All).enter(|infcx| {
-            let mut visitor = ExprVisitor {
-                infcx: &infcx
-            };
-            visitor.visit_body(body);
-        });
+        let owner_def_id = self.tcx.hir().body_owner_def_id(body_id);
+        let body = self.tcx.hir().body(body_id);
+        let param_env = self.tcx.param_env(owner_def_id);
+        let tables = self.tcx.typeck_tables_of(owner_def_id);
+        ExprVisitor { tcx: self.tcx, param_env, tables }.visit_body(body);
         self.visit_body(body);
     }
 }
 
-impl<'a, 'gcx, 'tcx> Visitor<'gcx> for ExprVisitor<'a, 'gcx, 'tcx> {
-    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'gcx> {
+impl Visitor<'tcx> for ExprVisitor<'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
         NestedVisitorMap::None
     }
 
-    fn visit_expr(&mut self, expr: &'gcx hir::Expr) {
-        let def = if let hir::ExprPath(ref qpath) = expr.node {
-            self.infcx.tables.borrow().qpath_def(qpath, expr.id)
+    fn visit_expr(&mut self, expr: &'tcx hir::Expr) {
+        let res = if let hir::ExprKind::Path(ref qpath) = expr.kind {
+            self.tables.qpath_res(qpath, expr.hir_id)
         } else {
-            Def::Err
+            Res::Err
         };
-        match def {
-            Def::Fn(did) if self.def_id_is_transmute(did) => {
-                let typ = self.infcx.tables.borrow().node_id_to_type(expr.id);
-                let typ = self.infcx.tcx.lift_to_global(&typ).unwrap();
-                match typ.sty {
-                    ty::TyFnDef(.., ref bare_fn_ty) if bare_fn_ty.abi == RustIntrinsic => {
-                        let from = bare_fn_ty.sig.skip_binder().inputs()[0];
-                        let to = bare_fn_ty.sig.skip_binder().output();
-                        self.check_transmute(expr.span, from, to, expr.id);
-                    }
-                    _ => {
-                        span_bug!(expr.span, "transmute wasn't a bare fn?!");
-                    }
-                }
+        if let Res::Def(DefKind::Fn, did) = res {
+            if self.def_id_is_transmute(did) {
+                let typ = self.tables.node_type(expr.hir_id);
+                let sig = typ.fn_sig(self.tcx);
+                let from = sig.inputs().skip_binder()[0];
+                let to = *sig.output().skip_binder();
+                self.check_transmute(expr.span, from, to);
             }
-            _ => {}
         }
 
         intravisit::walk_expr(self, expr);

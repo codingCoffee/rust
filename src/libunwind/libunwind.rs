@@ -1,24 +1,9 @@
-// Copyright 2016 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-#![allow(bad_style)]
-
-macro_rules! cfg_if {
-    ( $( if #[cfg( $meta:meta )] { $($it1:item)* } else { $($it2:item)* } )* ) =>
-        ( $( $( #[cfg($meta)] $it1)* $( #[cfg(not($meta))] $it2)* )* )
-}
+#![allow(nonstandard_style)]
 
 use libc::{c_int, c_void, uintptr_t};
 
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum _Unwind_Reason_Code {
     _URC_NO_REASON = 0,
     _URC_FOREIGN_EXCEPTION_CAUGHT = 1,
@@ -31,7 +16,7 @@ pub enum _Unwind_Reason_Code {
     _URC_CONTINUE_UNWIND = 8,
     _URC_FAILURE = 9, // used only by ARM EHABI
 }
-pub use self::_Unwind_Reason_Code::*;
+pub use _Unwind_Reason_Code::*;
 
 pub type _Unwind_Exception_Class = u64;
 pub type _Unwind_Word = uintptr_t;
@@ -71,6 +56,9 @@ pub const unwinder_private_data_size: usize = 2;
 #[cfg(target_os = "emscripten")]
 pub const unwinder_private_data_size: usize = 20;
 
+#[cfg(all(target_arch = "hexagon", target_os = "linux"))]
+pub const unwinder_private_data_size: usize = 35;
+
 #[repr(C)]
 pub struct _Unwind_Exception {
     pub exception_class: _Unwind_Exception_Class,
@@ -82,8 +70,11 @@ pub enum _Unwind_Context {}
 
 pub type _Unwind_Exception_Cleanup_Fn = extern "C" fn(unwind_code: _Unwind_Reason_Code,
                                                       exception: *mut _Unwind_Exception);
+#[cfg_attr(all(feature = "llvm-libunwind",
+               any(target_os = "fuchsia", target_os = "linux")),
+           link(name = "unwind", kind = "static"))]
 extern "C" {
-    #[unwind]
+    #[unwind(allowed)]
     pub fn _Unwind_Resume(exception: *mut _Unwind_Exception) -> !;
     pub fn _Unwind_DeleteException(exception: *mut _Unwind_Exception);
     pub fn _Unwind_GetLanguageSpecificData(ctx: *mut _Unwind_Context) -> *mut c_void;
@@ -92,9 +83,8 @@ extern "C" {
     pub fn _Unwind_GetDataRelBase(ctx: *mut _Unwind_Context) -> _Unwind_Ptr;
 }
 
-cfg_if! {
-if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
-                 all(target_os = "linux", target_arch = "arm"))))] {
+cfg_if::cfg_if! {
+if #[cfg(all(any(target_os = "ios", target_os = "netbsd", not(target_arch = "arm"))))] {
     // Not ARM EHABI
     #[repr(C)]
     #[derive(Copy, Clone, PartialEq)]
@@ -105,8 +95,11 @@ if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
         _UA_FORCE_UNWIND = 8,
         _UA_END_OF_STACK = 16,
     }
-    pub use self::_Unwind_Action::*;
+    pub use _Unwind_Action::*;
 
+    #[cfg_attr(all(feature = "llvm-libunwind",
+                   any(target_os = "fuchsia", target_os = "linux")),
+               link(name = "unwind", kind = "static"))]
     extern "C" {
         pub fn _Unwind_GetGR(ctx: *mut _Unwind_Context, reg_index: c_int) -> _Unwind_Word;
         pub fn _Unwind_SetGR(ctx: *mut _Unwind_Context, reg_index: c_int, value: _Unwind_Word);
@@ -129,7 +122,7 @@ if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
         _US_FORCE_UNWIND = 8,
         _US_END_OF_STACK = 16,
     }
-    pub use self::_Unwind_State::*;
+    pub use _Unwind_State::*;
 
     #[repr(C)]
     enum _Unwind_VRS_Result {
@@ -145,7 +138,7 @@ if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
         _UVRSC_WMMXD = 3,
         _UVRSC_WMMXC = 4,
     }
-    use self::_Unwind_VRS_RegClass::*;
+    use _Unwind_VRS_RegClass::*;
     #[repr(C)]
     enum _Unwind_VRS_DataRepresentation {
         _UVRSD_UINT32 = 0,
@@ -155,11 +148,14 @@ if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
         _UVRSD_FLOAT = 4,
         _UVRSD_DOUBLE = 5,
     }
-    use self::_Unwind_VRS_DataRepresentation::*;
+    use _Unwind_VRS_DataRepresentation::*;
 
     pub const UNWIND_POINTER_REG: c_int = 12;
     pub const UNWIND_IP_REG: c_int = 15;
 
+    #[cfg_attr(all(feature = "llvm-libunwind",
+                   any(target_os = "fuchsia", target_os = "linux")),
+               link(name = "unwind", kind = "static"))]
     extern "C" {
         fn _Unwind_VRS_Get(ctx: *mut _Unwind_Context,
                            regclass: _Unwind_VRS_RegClass,
@@ -217,11 +213,16 @@ if #[cfg(not(any(all(target_os = "android", target_arch = "arm"),
         pc
     }
 }
+} // cfg_if!
 
+cfg_if::cfg_if! {
 if #[cfg(not(all(target_os = "ios", target_arch = "arm")))] {
     // Not 32-bit iOS
+    #[cfg_attr(all(feature = "llvm-libunwind",
+                   any(target_os = "fuchsia", target_os = "linux")),
+               link(name = "unwind", kind = "static"))]
     extern "C" {
-        #[unwind]
+        #[unwind(allowed)]
         pub fn _Unwind_RaiseException(exception: *mut _Unwind_Exception) -> _Unwind_Reason_Code;
         pub fn _Unwind_Backtrace(trace: _Unwind_Trace_Fn,
                                  trace_argument: *mut c_void)
@@ -229,8 +230,11 @@ if #[cfg(not(all(target_os = "ios", target_arch = "arm")))] {
     }
 } else {
     // 32-bit iOS uses SjLj and does not provide _Unwind_Backtrace()
+    #[cfg_attr(all(feature = "llvm-libunwind",
+                   any(target_os = "fuchsia", target_os = "linux")),
+               link(name = "unwind", kind = "static"))]
     extern "C" {
-        #[unwind]
+        #[unwind(allowed)]
         pub fn _Unwind_SjLj_RaiseException(e: *mut _Unwind_Exception) -> _Unwind_Reason_Code;
     }
 
@@ -240,34 +244,3 @@ if #[cfg(not(all(target_os = "ios", target_arch = "arm")))] {
     }
 }
 } // cfg_if!
-
-#[cfg_attr(any(all(target_os = "linux", not(target_env = "musl")),
-               target_os = "freebsd",
-               target_os = "solaris",
-               target_os = "haiku",
-               all(target_os = "linux",
-                   target_env = "musl",
-                   not(target_arch = "x86"),
-                   not(target_arch = "x86_64"))),
-           link(name = "gcc_s"))]
-#[cfg_attr(all(target_os = "linux",
-               target_env = "musl",
-               any(target_arch = "x86", target_arch = "x86_64"),
-               not(test)),
-           link(name = "unwind", kind = "static"))]
-#[cfg_attr(target_os = "fuchsia",
-           link(name = "unwind"))]
-#[cfg_attr(any(target_os = "android", target_os = "openbsd"),
-           link(name = "gcc"))]
-#[cfg_attr(all(target_os = "netbsd", not(target_vendor = "rumprun")),
-           link(name = "gcc"))]
-#[cfg_attr(all(target_os = "netbsd", target_vendor = "rumprun"),
-           link(name = "unwind"))]
-#[cfg_attr(target_os = "dragonfly",
-           link(name = "gcc_pic"))]
-#[cfg_attr(target_os = "bitrig",
-           link(name = "c++abi"))]
-#[cfg_attr(all(target_os = "windows", target_env = "gnu"),
-           link(name = "gcc_eh"))]
-#[cfg(not(cargobuild))]
-extern "C" {}

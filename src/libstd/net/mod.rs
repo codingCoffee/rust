@@ -1,20 +1,34 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Networking primitives for TCP/UDP communication.
+//!
+//! This module provides networking functionality for the Transmission Control and User
+//! Datagram Protocols, as well as types for IP and socket addresses.
+//!
+//! # Organization
+//!
+//! * [`TcpListener`] and [`TcpStream`] provide functionality for communication over TCP
+//! * [`UdpSocket`] provides functionality for communication over UDP
+//! * [`IpAddr`] represents IP addresses of either IPv4 or IPv6; [`Ipv4Addr`] and
+//!   [`Ipv6Addr`] are respectively IPv4 and IPv6 addresses
+//! * [`SocketAddr`] represents socket addresses of either IPv4 or IPv6; [`SocketAddrV4`]
+//!   and [`SocketAddrV6`] are respectively IPv4 and IPv6 socket addresses
+//! * [`ToSocketAddrs`] is a trait that used for generic address resolution when interacting
+//!   with networking objects like [`TcpListener`], [`TcpStream`] or [`UdpSocket`]
+//! * Other types are return or parameter types for various methods in this module
+//!
+//! [`IpAddr`]: ../../std/net/enum.IpAddr.html
+//! [`Ipv4Addr`]: ../../std/net/struct.Ipv4Addr.html
+//! [`Ipv6Addr`]: ../../std/net/struct.Ipv6Addr.html
+//! [`SocketAddr`]: ../../std/net/enum.SocketAddr.html
+//! [`SocketAddrV4`]: ../../std/net/struct.SocketAddrV4.html
+//! [`SocketAddrV6`]: ../../std/net/struct.SocketAddrV6.html
+//! [`TcpListener`]: ../../std/net/struct.TcpListener.html
+//! [`TcpStream`]: ../../std/net/struct.TcpStream.html
+//! [`ToSocketAddrs`]: ../../std/net/trait.ToSocketAddrs.html
+//! [`UdpSocket`]: ../../std/net/struct.UdpSocket.html
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use fmt;
-use io::{self, Error, ErrorKind};
-use sys_common::net as net_imp;
+use crate::io::{self, Error, ErrorKind};
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::ip::{IpAddr, Ipv4Addr, Ipv6Addr, Ipv6MulticastScope};
@@ -43,17 +57,30 @@ mod test;
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub enum Shutdown {
-    /// Indicates that the reading portion of this stream/socket should be shut
-    /// down. All currently blocked and future reads will return `Ok(0)`.
+    /// The reading portion of the [`TcpStream`] should be shut down.
+    ///
+    /// All currently blocked and future [reads] will return [`Ok(0)`].
+    ///
+    /// [`TcpStream`]: ../../std/net/struct.TcpStream.html
+    /// [reads]: ../../std/io/trait.Read.html
+    /// [`Ok(0)`]: ../../std/result/enum.Result.html#variant.Ok
     #[stable(feature = "rust1", since = "1.0.0")]
     Read,
-    /// Indicates that the writing portion of this stream/socket should be shut
-    /// down. All currently blocked and future writes will return an error.
+    /// The writing portion of the [`TcpStream`] should be shut down.
+    ///
+    /// All currently blocked and future [writes] will return an error.
+    ///
+    /// [`TcpStream`]: ../../std/net/struct.TcpStream.html
+    /// [writes]: ../../std/io/trait.Write.html
     #[stable(feature = "rust1", since = "1.0.0")]
     Write,
-    /// Shut down both the reading and writing portions of this stream.
+    /// Both the reading and the writing portions of the [`TcpStream`] should be shut down.
     ///
-    /// See `Shutdown::Read` and `Shutdown::Write` for more information.
+    /// See [`Shutdown::Read`] and [`Shutdown::Write`] for more information.
+    ///
+    /// [`TcpStream`]: ../../std/net/struct.TcpStream.html
+    /// [`Shutdown::Read`]: #variant.Read
+    /// [`Shutdown::Write`]: #variant.Write
     #[stable(feature = "rust1", since = "1.0.0")]
     Both,
 }
@@ -75,11 +102,15 @@ fn hton<I: NetInt>(i: I) -> I { i.to_be() }
 fn ntoh<I: NetInt>(i: I) -> I { I::from_be(i) }
 
 fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
-    where F: FnMut(&SocketAddr) -> io::Result<T>
+    where F: FnMut(io::Result<&SocketAddr>) -> io::Result<T>
 {
+    let addrs = match addr.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(e) => return f(Err(e))
+    };
     let mut last_err = None;
-    for addr in addr.to_socket_addrs()? {
-        match f(&addr) {
+    for addr in addrs {
+        match f(Ok(&addr)) {
             Ok(l) => return Ok(l),
             Err(e) => last_err = Some(e),
         }
@@ -88,57 +119,4 @@ fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
         Error::new(ErrorKind::InvalidInput,
                    "could not resolve to any addresses")
     }))
-}
-
-/// An iterator over `SocketAddr` values returned from a host lookup operation.
-#[unstable(feature = "lookup_host", reason = "unsure about the returned \
-                                              iterator and returning socket \
-                                              addresses",
-           issue = "27705")]
-pub struct LookupHost(net_imp::LookupHost);
-
-#[unstable(feature = "lookup_host", reason = "unsure about the returned \
-                                              iterator and returning socket \
-                                              addresses",
-           issue = "27705")]
-impl Iterator for LookupHost {
-    type Item = SocketAddr;
-    fn next(&mut self) -> Option<SocketAddr> { self.0.next() }
-}
-
-#[stable(feature = "std_debug", since = "1.15.0")]
-impl fmt::Debug for LookupHost {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.pad("LookupHost { .. }")
-    }
-}
-
-/// Resolve the host specified by `host` as a number of `SocketAddr` instances.
-///
-/// This method may perform a DNS query to resolve `host` and may also inspect
-/// system configuration to resolve the specified hostname.
-///
-/// The returned iterator will skip over any unknown addresses returned by the
-/// operating system.
-///
-/// # Examples
-///
-/// ```no_run
-/// #![feature(lookup_host)]
-///
-/// use std::net;
-///
-/// # fn foo() -> std::io::Result<()> {
-/// for host in try!(net::lookup_host("rust-lang.org")) {
-///     println!("found address: {}", host);
-/// }
-/// # Ok(())
-/// # }
-/// ```
-#[unstable(feature = "lookup_host", reason = "unsure about the returned \
-                                              iterator and returning socket \
-                                              addresses",
-           issue = "27705")]
-pub fn lookup_host(host: &str) -> io::Result<LookupHost> {
-    net_imp::lookup_host(host).map(LookupHost)
 }

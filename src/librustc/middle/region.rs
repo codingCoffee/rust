@@ -1,87 +1,51 @@
-// Copyright 2012-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-//! This file actually contains two passes related to regions.  The first
-//! pass builds up the `scope_map`, which describes the parent links in
-//! the region hierarchy.  The second pass infers which types must be
-//! region parameterized.
+//! This file builds up the `ScopeTree`, which describes
+//! the parent links in the region hierarchy.
 //!
-//! Most of the documentation on regions can be found in
-//! `middle/infer/region_inference/README.md`
+//! For more information about how MIR-based region-checking works,
+//! see the [rustc guide].
+//!
+//! [rustc guide]: https://rust-lang.github.io/rustc-guide/mir/borrowck.html
 
-use dep_graph::DepNode;
-use hir::map as ast_map;
-use session::Session;
-use util::nodemap::{FxHashMap, NodeMap, NodeSet};
-use ty;
+use crate::hir;
+use crate::hir::Node;
+use crate::hir::def_id::DefId;
+use crate::hir::intravisit::{self, Visitor, NestedVisitorMap};
+use crate::hir::{Block, Arm, Pat, PatKind, Stmt, Expr, Local};
+use crate::ich::{StableHashingContext, NodeIdHashingMode};
+use crate::util::nodemap::{FxHashMap, FxHashSet};
+use crate::ty::{self, DefIdTree, TyCtxt};
+use crate::ty::query::Providers;
 
-use std::cell::RefCell;
-use std::collections::hash_map::Entry;
+use rustc_data_structures::indexed_vec::Idx;
+use rustc_data_structures::stable_hasher::{HashStable, StableHasher, StableHasherResult};
+use rustc_macros::HashStable;
+use syntax::source_map;
+use syntax_pos::{Span, DUMMY_SP};
+
 use std::fmt;
 use std::mem;
-use syntax::codemap;
-use syntax::ast::{self, NodeId};
-use syntax_pos::Span;
 
-use hir;
-use hir::intravisit::{self, Visitor, FnKind, NestedVisitorMap};
-use hir::{Block, Item, FnDecl, Arm, Pat, PatKind, Stmt, Expr, Local};
-
-#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, RustcEncodable,
-           RustcDecodable, Copy)]
-pub struct CodeExtent(u32);
-
-impl fmt::Debug for CodeExtent {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "CodeExtent({:?}", self.0)?;
-
-        ty::tls::with_opt(|opt_tcx| {
-            if let Some(tcx) = opt_tcx {
-                if let Some(data) = tcx.region_maps.code_extents.borrow().get(self.0 as usize) {
-                    write!(f, "/{:?}", data)?;
-                }
-            }
-            Ok(())
-        })?;
-
-        write!(f, ")")
-    }
-}
-
-/// The root of everything. I should be using NonZero or profiling
-/// instead of this (probably).
-pub const ROOT_CODE_EXTENT : CodeExtent = CodeExtent(0);
-/// A placeholder used in trans to stand for real code extents
-pub const DUMMY_CODE_EXTENT : CodeExtent = CodeExtent(1);
-
-/// CodeExtent represents a statically-describable extent that can be
-/// used to bound the lifetime/region for values.
+/// Represents a statically-describable scope that can be used to
+/// bound the lifetime/region for values.
 ///
-/// `Misc(node_id)`: Any AST node that has any extent at all has the
-/// `Misc(node_id)` extent. Other variants represent special cases not
+/// `Node(node_id)`: Any AST node that has any scope at all has the
+/// `Node(node_id)` scope. Other variants represent special cases not
 /// immediately derivable from the abstract syntax tree structure.
 ///
-/// `DestructionScope(node_id)` represents the extent of destructors
+/// `DestructionScope(node_id)` represents the scope of destructors
 /// implicitly-attached to `node_id` that run immediately after the
 /// expression for `node_id` itself. Not every AST node carries a
 /// `DestructionScope`, but those that are `terminating_scopes` do;
-/// see discussion with `RegionMaps`.
+/// see discussion with `ScopeTree`.
 ///
-/// `Remainder(BlockRemainder { block, statement_index })` represents
-/// the extent of user code running immediately after the initializer
+/// `Remainder { block, statement_index }` represents
+/// the scope of user code running immediately after the initializer
 /// expression for the indexed statement, until the end of the block.
 ///
-/// So: the following code can be broken down into the extents beneath:
-/// ```
+/// So: the following code can be broken down into the scopes beneath:
+///
+/// ```text
 /// let a = f().g( 'b: { let x = d(); let y = d(); x.h(y)  }   ) ;
-/// ```
 ///
 ///                                                              +-+ (D12.)
 ///                                                        +-+       (D11.)
@@ -96,221 +60,325 @@ pub const DUMMY_CODE_EXTENT : CodeExtent = CodeExtent(1);
 ///         +--+                                                      (M2.)
 /// +-----------------------------------------------------------+     (M1.)
 ///
-///  (M1.): Misc extent of the whole `let a = ...;` statement.
-///  (M2.): Misc extent of the `f()` expression.
-///  (M3.): Misc extent of the `f().g(..)` expression.
-///  (M4.): Misc extent of the block labelled `'b:`.
-///  (M5.): Misc extent of the `let x = d();` statement
+///  (M1.): Node scope of the whole `let a = ...;` statement.
+///  (M2.): Node scope of the `f()` expression.
+///  (M3.): Node scope of the `f().g(..)` expression.
+///  (M4.): Node scope of the block labeled `'b:`.
+///  (M5.): Node scope of the `let x = d();` statement
 ///  (D6.): DestructionScope for temporaries created during M5.
-///  (R7.): Remainder extent for block `'b:`, stmt 0 (let x = ...).
-///  (M8.): Misc Extent of the `let y = d();` statement.
+///  (R7.): Remainder scope for block `'b:`, stmt 0 (let x = ...).
+///  (M8.): Node scope of the `let y = d();` statement.
 ///  (D9.): DestructionScope for temporaries created during M8.
-/// (R10.): Remainder extent for block `'b:`, stmt 1 (let y = ...).
+/// (R10.): Remainder scope for block `'b:`, stmt 1 (let y = ...).
 /// (D11.): DestructionScope for temporaries and bindings from block `'b:`.
-/// (D12.): DestructionScope for temporaries created during M1 (e.g. f()).
+/// (D12.): DestructionScope for temporaries created during M1 (e.g., f()).
+/// ```
 ///
 /// Note that while the above picture shows the destruction scopes
-/// as following their corresponding misc extents, in the internal
+/// as following their corresponding node scopes, in the internal
 /// data structures of the compiler the destruction scopes are
 /// represented as enclosing parents. This is sound because we use the
 /// enclosing parent relationship just to ensure that referenced
 /// values live long enough; phrased another way, the starting point
 /// of each range is not really the important thing in the above
 /// picture, but rather the ending point.
-///
-/// FIXME (pnkfelix): This currently derives `PartialOrd` and `Ord` to
-/// placate the same deriving in `ty::FreeRegion`, but we may want to
-/// actually attach a more meaningful ordering to scopes than the one
-/// generated via deriving here.
-#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy)]
-pub enum CodeExtentData {
-    Misc(ast::NodeId),
-
-    // extent of the call-site for a function or closure (outlives
-    // the parameters as well as the body).
-    CallSiteScope { fn_id: ast::NodeId, body_id: ast::NodeId },
-
-    // extent of parameters passed to a function or closure (they
-    // outlive its body)
-    ParameterScope { fn_id: ast::NodeId, body_id: ast::NodeId },
-
-    // extent of destructors for temporaries of node-id
-    DestructionScope(ast::NodeId),
-
-    // extent of code following a `let id = expr;` binding in a block
-    Remainder(BlockRemainder)
+//
+// FIXME(pnkfelix): this currently derives `PartialOrd` and `Ord` to
+// placate the same deriving in `ty::FreeRegion`, but we may want to
+// actually attach a more meaningful ordering to scopes than the one
+// generated via deriving here.
+#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Copy,
+         RustcEncodable, RustcDecodable, HashStable)]
+pub struct Scope {
+    pub id: hir::ItemLocalId,
+    pub data: ScopeData,
 }
 
-/// extent of call-site for a function/method.
-#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, RustcEncodable,
-           RustcDecodable, Debug, Copy)]
-pub struct CallSiteScopeData {
-    pub fn_id: ast::NodeId, pub body_id: ast::NodeId,
-}
-
-impl CallSiteScopeData {
-    pub fn to_code_extent(&self, region_maps: &RegionMaps) -> CodeExtent {
-        region_maps.lookup_code_extent(
-            match *self {
-                CallSiteScopeData { fn_id, body_id } =>
-                    CodeExtentData::CallSiteScope { fn_id: fn_id, body_id: body_id },
-            })
+impl fmt::Debug for Scope {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.data {
+            ScopeData::Node => write!(fmt, "Node({:?})", self.id),
+            ScopeData::CallSite => write!(fmt, "CallSite({:?})", self.id),
+            ScopeData::Arguments => write!(fmt, "Arguments({:?})", self.id),
+            ScopeData::Destruction => write!(fmt, "Destruction({:?})", self.id),
+            ScopeData::Remainder(fsi) => write!(
+                fmt,
+                "Remainder {{ block: {:?}, first_statement_index: {}}}",
+                self.id,
+                fsi.as_u32(),
+            ),
+        }
     }
 }
 
-/// Represents a subscope of `block` for a binding that is introduced
-/// by `block.stmts[first_statement_index]`. Such subscopes represent
-/// a suffix of the block. Note that each subscope does not include
-/// the initializer expression, if any, for the statement indexed by
-/// `first_statement_index`.
-///
-/// For example, given `{ let (a, b) = EXPR_1; let c = EXPR_2; ... }`:
-///
-/// * the subscope with `first_statement_index == 0` is scope of both
-///   `a` and `b`; it does not include EXPR_1, but does include
-///   everything after that first `let`. (If you want a scope that
-///   includes EXPR_1 as well, then do not use `CodeExtentData::Remainder`,
-///   but instead another `CodeExtent` that encompasses the whole block,
-///   e.g. `CodeExtentData::Misc`.
-///
-/// * the subscope with `first_statement_index == 1` is scope of `c`,
-///   and thus does not include EXPR_2, but covers the `...`.
-#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, RustcEncodable,
-         RustcDecodable, Debug, Copy)]
-pub struct BlockRemainder {
-    pub block: ast::NodeId,
-    pub first_statement_index: u32,
+#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Hash, Debug, Copy,
+         RustcEncodable, RustcDecodable, HashStable)]
+pub enum ScopeData {
+    Node,
+
+    /// Scope of the call-site for a function or closure
+    /// (outlives the arguments as well as the body).
+    CallSite,
+
+    /// Scope of arguments passed to a function or closure
+    /// (they outlive its body).
+    Arguments,
+
+    /// Scope of destructors for temporaries of node-id.
+    Destruction,
+
+    /// Scope following a `let id = expr;` binding in a block.
+    Remainder(FirstStatementIndex)
 }
 
-impl CodeExtentData {
-    /// Returns a node id associated with this scope.
+newtype_index! {
+    /// Represents a subscope of `block` for a binding that is introduced
+    /// by `block.stmts[first_statement_index]`. Such subscopes represent
+    /// a suffix of the block. Note that each subscope does not include
+    /// the initializer expression, if any, for the statement indexed by
+    /// `first_statement_index`.
     ///
-    /// NB: likely to be replaced as API is refined; e.g. pnkfelix
-    /// anticipates `fn entry_node_id` and `fn each_exit_node_id`.
-    pub fn node_id(&self) -> ast::NodeId {
-        match *self {
-            CodeExtentData::Misc(node_id) => node_id,
-
-            // These cases all return rough approximations to the
-            // precise extent denoted by `self`.
-            CodeExtentData::Remainder(br) => br.block,
-            CodeExtentData::DestructionScope(node_id) => node_id,
-            CodeExtentData::CallSiteScope { fn_id: _, body_id } |
-            CodeExtentData::ParameterScope { fn_id: _, body_id } => body_id,
-        }
+    /// For example, given `{ let (a, b) = EXPR_1; let c = EXPR_2; ... }`:
+    ///
+    /// * The subscope with `first_statement_index == 0` is scope of both
+    ///   `a` and `b`; it does not include EXPR_1, but does include
+    ///   everything after that first `let`. (If you want a scope that
+    ///   includes EXPR_1 as well, then do not use `Scope::Remainder`,
+    ///   but instead another `Scope` that encompasses the whole block,
+    ///   e.g., `Scope::Node`.
+    ///
+    /// * The subscope with `first_statement_index == 1` is scope of `c`,
+    ///   and thus does not include EXPR_2, but covers the `...`.
+    pub struct FirstStatementIndex {
+        derive [HashStable]
     }
 }
 
-impl CodeExtent {
-    #[inline]
-    fn into_option(self) -> Option<CodeExtent> {
-        if self == ROOT_CODE_EXTENT {
-            None
-        } else {
-            Some(self)
-        }
-    }
-    pub fn node_id(&self, region_maps: &RegionMaps) -> ast::NodeId {
-        region_maps.code_extent_data(*self).node_id()
+// compilation error if size of `ScopeData` is not the same as a `u32`
+static_assert_size!(ScopeData, 4);
+
+impl Scope {
+    /// Returns a item-local ID associated with this scope.
+    ///
+    /// N.B., likely to be replaced as API is refined; e.g., pnkfelix
+    /// anticipates `fn entry_node_id` and `fn each_exit_node_id`.
+    pub fn item_local_id(&self) -> hir::ItemLocalId {
+        self.id
     }
 
-    /// Returns the span of this CodeExtent.  Note that in general the
-    /// returned span may not correspond to the span of any node id in
-    /// the AST.
-    pub fn span(&self, region_maps: &RegionMaps, ast_map: &ast_map::Map) -> Option<Span> {
-        match ast_map.find(self.node_id(region_maps)) {
-            Some(ast_map::NodeBlock(ref blk)) => {
-                match region_maps.code_extent_data(*self) {
-                    CodeExtentData::CallSiteScope { .. } |
-                    CodeExtentData::ParameterScope { .. } |
-                    CodeExtentData::Misc(_) |
-                    CodeExtentData::DestructionScope(_) => Some(blk.span),
-
-                    CodeExtentData::Remainder(r) => {
-                        assert_eq!(r.block, blk.id);
-                        // Want span for extent starting after the
-                        // indexed statement and ending at end of
-                        // `blk`; reuse span of `blk` and shift `lo`
-                        // forward to end of indexed statement.
-                        //
-                        // (This is the special case aluded to in the
-                        // doc-comment for this method)
-                        let stmt_span = blk.stmts[r.first_statement_index as usize].span;
-                        Some(Span { lo: stmt_span.hi, hi: blk.span.hi, expn_id: stmt_span.expn_id })
-                    }
+    pub fn hir_id(&self, scope_tree: &ScopeTree) -> hir::HirId {
+        match scope_tree.root_body {
+            Some(hir_id) => {
+                hir::HirId {
+                    owner: hir_id.owner,
+                    local_id: self.item_local_id()
                 }
             }
-            Some(ast_map::NodeExpr(ref expr)) => Some(expr.span),
-            Some(ast_map::NodeStmt(ref stmt)) => Some(stmt.span),
-            Some(ast_map::NodeItem(ref item)) => Some(item.span),
-            Some(_) | None => None,
+            None => hir::DUMMY_HIR_ID
+        }
+    }
+
+    /// Returns the span of this `Scope`. Note that in general the
+    /// returned span may not correspond to the span of any `NodeId` in
+    /// the AST.
+    pub fn span(&self, tcx: TyCtxt<'_>, scope_tree: &ScopeTree) -> Span {
+        let hir_id = self.hir_id(scope_tree);
+        if hir_id == hir::DUMMY_HIR_ID {
+            return DUMMY_SP;
+        }
+        let span = tcx.hir().span(hir_id);
+        if let ScopeData::Remainder(first_statement_index) = self.data {
+            if let Node::Block(ref blk) = tcx.hir().get(hir_id) {
+                // Want span for scope starting after the
+                // indexed statement and ending at end of
+                // `blk`; reuse span of `blk` and shift `lo`
+                // forward to end of indexed statement.
+                //
+                // (This is the special case aluded to in the
+                // doc-comment for this method)
+
+                let stmt_span = blk.stmts[first_statement_index.index()].span;
+
+                // To avoid issues with macro-generated spans, the span
+                // of the statement must be nested in that of the block.
+                if span.lo() <= stmt_span.lo() && stmt_span.lo() <= span.hi() {
+                    return Span::new(stmt_span.lo(), span.hi(), span.ctxt());
+                }
+            }
          }
+         span
     }
 }
 
-/// The region maps encode information about region relationships.
-pub struct RegionMaps {
-    code_extents: RefCell<Vec<CodeExtentData>>,
-    code_extent_interner: RefCell<FxHashMap<CodeExtentData, CodeExtent>>,
-    /// `scope_map` maps from a scope id to the enclosing scope id;
+pub type ScopeDepth = u32;
+
+/// The region scope tree encodes information about region relationships.
+#[derive(Default, Debug)]
+pub struct ScopeTree {
+    /// If not empty, this body is the root of this region hierarchy.
+    root_body: Option<hir::HirId>,
+
+    /// The parent of the root body owner, if the latter is an
+    /// an associated const or method, as impls/traits can also
+    /// have lifetime parameters free in this body.
+    root_parent: Option<hir::HirId>,
+
+    /// Maps from a scope ID to the enclosing scope id;
     /// this is usually corresponding to the lexical nesting, though
     /// in the case of closures the parent scope is the innermost
     /// conditional expression or repeating block. (Note that the
-    /// enclosing scope id for the block associated with a closure is
+    /// enclosing scope ID for the block associated with a closure is
     /// the closure itself.)
-    scope_map: RefCell<Vec<CodeExtent>>,
+    parent_map: FxHashMap<Scope, (Scope, ScopeDepth)>,
 
-    /// `var_map` maps from a variable or binding id to the block in
-    /// which that variable is declared.
-    var_map: RefCell<NodeMap<CodeExtent>>,
+    /// Maps from a variable or binding ID to the block in which that
+    /// variable is declared.
+    var_map: FxHashMap<hir::ItemLocalId, Scope>,
 
-    /// `rvalue_scopes` includes entries for those expressions whose cleanup scope is
-    /// larger than the default. The map goes from the expression id
-    /// to the cleanup scope id. For rvalues not present in this
-    /// table, the appropriate cleanup scope is the innermost
+    /// Maps from a `NodeId` to the associated destruction scope (if any).
+    destruction_scopes: FxHashMap<hir::ItemLocalId, Scope>,
+
+    /// `rvalue_scopes` includes entries for those expressions whose
+    /// cleanup scope is larger than the default. The map goes from the
+    /// expression ID to the cleanup scope id. For rvalues not present in
+    /// this table, the appropriate cleanup scope is the innermost
     /// enclosing statement, conditional expression, or repeating
     /// block (see `terminating_scopes`).
-    rvalue_scopes: RefCell<NodeMap<CodeExtent>>,
+    /// In constants, None is used to indicate that certain expressions
+    /// escape into 'static and should have no local cleanup scope.
+    rvalue_scopes: FxHashMap<hir::ItemLocalId, Option<Scope>>,
 
     /// Encodes the hierarchy of fn bodies. Every fn body (including
     /// closures) forms its own distinct region hierarchy, rooted in
-    /// the block that is the fn body. This map points from the id of
-    /// that root block to the id of the root block for the enclosing
+    /// the block that is the fn body. This map points from the ID of
+    /// that root block to the ID of the root block for the enclosing
     /// fn, if any. Thus the map structures the fn bodies into a
     /// hierarchy based on their lexical mapping. This is used to
     /// handle the relationships between regions in a fn and in a
     /// closure defined by that fn. See the "Modeling closures"
-    /// section of the README in infer::region_inference for
+    /// section of the README in infer::region_constraints for
     /// more details.
-    fn_tree: RefCell<NodeMap<ast::NodeId>>,
+    closure_tree: FxHashMap<hir::ItemLocalId, hir::ItemLocalId>,
+
+    /// If there are any `yield` nested within a scope, this map
+    /// stores the `Span` of the last one and its index in the
+    /// postorder of the Visitor traversal on the HIR.
+    ///
+    /// HIR Visitor postorder indexes might seem like a peculiar
+    /// thing to care about. but it turns out that HIR bindings
+    /// and the temporary results of HIR expressions are never
+    /// storage-live at the end of HIR nodes with postorder indexes
+    /// lower than theirs, and therefore don't need to be suspended
+    /// at yield-points at these indexes.
+    ///
+    /// For an example, suppose we have some code such as:
+    /// ```rust,ignore (example)
+    ///     foo(f(), yield y, bar(g()))
+    /// ```
+    ///
+    /// With the HIR tree (calls numbered for expository purposes)
+    /// ```
+    ///     Call#0(foo, [Call#1(f), Yield(y), Call#2(bar, Call#3(g))])
+    /// ```
+    ///
+    /// Obviously, the result of `f()` was created before the yield
+    /// (and therefore needs to be kept valid over the yield) while
+    /// the result of `g()` occurs after the yield (and therefore
+    /// doesn't). If we want to infer that, we can look at the
+    /// postorder traversal:
+    /// ```plain,ignore
+    ///     `foo` `f` Call#1 `y` Yield `bar` `g` Call#3 Call#2 Call#0
+    /// ```
+    ///
+    /// In which we can easily see that `Call#1` occurs before the yield,
+    /// and `Call#3` after it.
+    ///
+    /// To see that this method works, consider:
+    ///
+    /// Let `D` be our binding/temporary and `U` be our other HIR node, with
+    /// `HIR-postorder(U) < HIR-postorder(D)` (in our example, U would be
+    /// the yield and D would be one of the calls). Let's show that
+    /// `D` is storage-dead at `U`.
+    ///
+    /// Remember that storage-live/storage-dead refers to the state of
+    /// the *storage*, and does not consider moves/drop flags.
+    ///
+    /// Then:
+    ///     1. From the ordering guarantee of HIR visitors (see
+    ///     `rustc::hir::intravisit`), `D` does not dominate `U`.
+    ///     2. Therefore, `D` is *potentially* storage-dead at `U` (because
+    ///     we might visit `U` without ever getting to `D`).
+    ///     3. However, we guarantee that at each HIR point, each
+    ///     binding/temporary is always either always storage-live
+    ///     or always storage-dead. This is what is being guaranteed
+    ///     by `terminating_scopes` including all blocks where the
+    ///     count of executions is not guaranteed.
+    ///     4. By `2.` and `3.`, `D` is *statically* storage-dead at `U`,
+    ///     QED.
+    ///
+    /// This property ought to not on (3) in an essential way -- it
+    /// is probably still correct even if we have "unrestricted" terminating
+    /// scopes. However, why use the complicated proof when a simple one
+    /// works?
+    ///
+    /// A subtle thing: `box` expressions, such as `box (&x, yield 2, &y)`. It
+    /// might seem that a `box` expression creates a `Box<T>` temporary
+    /// when it *starts* executing, at `HIR-preorder(BOX-EXPR)`. That might
+    /// be true in the MIR desugaring, but it is not important in the semantics.
+    ///
+    /// The reason is that semantically, until the `box` expression returns,
+    /// the values are still owned by their containing expressions. So
+    /// we'll see that `&x`.
+    yield_in_scope: FxHashMap<Scope, YieldData>,
+
+    /// The number of visit_expr and visit_pat calls done in the body.
+    /// Used to sanity check visit_expr/visit_pat call count when
+    /// calculating generator interiors.
+    body_expr_count: FxHashMap<hir::BodyId, usize>,
+}
+
+#[derive(Debug, Copy, Clone, RustcEncodable, RustcDecodable, HashStable)]
+pub struct YieldData {
+    /// The `Span` of the yield.
+    pub span: Span,
+    /// The number of expressions and patterns appearing before the `yield` in the body plus one.
+    pub expr_and_pat_count: usize,
+    pub source: hir::YieldSource,
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct Context {
-    /// the root of the current region tree. This is typically the id
+    /// The root of the current region tree. This is typically the id
     /// of the innermost fn body. Each fn forms its own disjoint tree
     /// in the region hierarchy. These fn bodies are themselves
     /// arranged into a tree. See the "Modeling closures" section of
-    /// the README in infer::region_inference for more
+    /// the README in `infer::region_constraints` for more
     /// details.
-    root_id: Option<ast::NodeId>,
+    root_id: Option<hir::ItemLocalId>,
 
-    /// the scope that contains any new variables declared
-    var_parent: CodeExtent,
+    /// The scope that contains any new variables declared, plus its depth in
+    /// the scope tree.
+    var_parent: Option<(Scope, ScopeDepth)>,
 
-    /// region parent of expressions etc
-    parent: CodeExtent
+    /// Region parent of expressions, etc., plus its depth in the scope tree.
+    parent: Option<(Scope, ScopeDepth)>,
 }
 
-struct RegionResolutionVisitor<'ast: 'a, 'a> {
-    sess: &'a Session,
+struct RegionResolutionVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
 
-    // Generated maps:
-    region_maps: &'a RegionMaps,
+    // The number of expressions and patterns visited in the current body.
+    expr_and_pat_count: usize,
+    // When this is `true`, we record the `Scopes` we encounter
+    // when processing a Yield expression. This allows us to fix
+    // up their indices.
+    pessimistic_yield: bool,
+    // Stores scopes when `pessimistic_yield` is `true`.
+    fixup_scopes: Vec<Scope>,
+    // The generated scope tree.
+    scope_tree: ScopeTree,
 
     cx: Context,
-
-    map: &'a ast_map::Map<'ast>,
 
     /// `terminating_scopes` is a set containing the ids of each
     /// statement, or conditional/repeating expression. These scopes
@@ -326,177 +394,149 @@ struct RegionResolutionVisitor<'ast: 'a, 'a> {
     /// upon exiting the parent scope, we cannot statically know how
     /// many times the expression executed, and thus if the expression
     /// creates temporaries we cannot know statically how many such
-    /// temporaries we would have to cleanup. Therefore we ensure that
+    /// temporaries we would have to cleanup. Therefore, we ensure that
     /// the temporaries never outlast the conditional/repeating
     /// expression, preventing the need for dynamic checks and/or
     /// arbitrary amounts of stack space. Terminating scopes end
     /// up being contained in a DestructionScope that contains the
     /// destructor's execution.
-    terminating_scopes: NodeSet
+    terminating_scopes: FxHashSet<hir::ItemLocalId>,
 }
 
+struct ExprLocatorVisitor {
+    hir_id: hir::HirId,
+    result: Option<usize>,
+    expr_and_pat_count: usize,
+}
 
-impl RegionMaps {
-    /// create a bogus code extent for the regions in astencode types. Nobody
-    /// really cares about the contents of these.
-    pub fn bogus_code_extent(&self, e: CodeExtentData) -> CodeExtent {
-        self.intern_code_extent(e, DUMMY_CODE_EXTENT)
+// This visitor has to have the same `visit_expr` calls as `RegionResolutionVisitor`
+// since `expr_count` is compared against the results there.
+impl<'tcx> Visitor<'tcx> for ExprLocatorVisitor {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::None
     }
-    pub fn lookup_code_extent(&self, e: CodeExtentData) -> CodeExtent {
-        match self.code_extent_interner.borrow().get(&e) {
-            Some(&d) => d,
-            None => bug!("unknown code extent {:?}", e)
+
+    fn visit_pat(&mut self, pat: &'tcx Pat) {
+        intravisit::walk_pat(self, pat);
+
+        self.expr_and_pat_count += 1;
+
+        if pat.hir_id == self.hir_id {
+            self.result = Some(self.expr_and_pat_count);
         }
     }
-    pub fn node_extent(&self, n: ast::NodeId) -> CodeExtent {
-        self.lookup_code_extent(CodeExtentData::Misc(n))
-    }
-    // Returns the code extent for an item - the destruction scope.
-    pub fn item_extent(&self, n: ast::NodeId) -> CodeExtent {
-        self.lookup_code_extent(CodeExtentData::DestructionScope(n))
-    }
-    pub fn call_site_extent(&self, fn_id: ast::NodeId, body_id: ast::NodeId) -> CodeExtent {
-        assert!(fn_id != body_id);
-        self.lookup_code_extent(CodeExtentData::CallSiteScope { fn_id: fn_id, body_id: body_id })
-    }
-    pub fn opt_destruction_extent(&self, n: ast::NodeId) -> Option<CodeExtent> {
-        self.code_extent_interner.borrow().get(&CodeExtentData::DestructionScope(n)).cloned()
-    }
-    pub fn intern_code_extent(&self,
-                              e: CodeExtentData,
-                              parent: CodeExtent) -> CodeExtent {
-        match self.code_extent_interner.borrow_mut().entry(e) {
-            Entry::Occupied(o) => {
-                // this can happen when the bogus code extents from tydecode
-                // have (bogus) NodeId-s that overlap items created during
-                // inlining.
-                // We probably shouldn't be creating bogus code extents
-                // though.
-                let idx = *o.get();
-                if parent == DUMMY_CODE_EXTENT {
-                    info!("CodeExtent({}) = {:?} [parent={}] BOGUS!",
-                          idx.0, e, parent.0);
-                } else {
-                    assert_eq!(self.scope_map.borrow()[idx.0 as usize],
-                               DUMMY_CODE_EXTENT);
-                    info!("CodeExtent({}) = {:?} [parent={}] RECLAIMED!",
-                          idx.0, e, parent.0);
-                    self.scope_map.borrow_mut()[idx.0 as usize] = parent;
-                }
-                idx
-            }
-            Entry::Vacant(v) => {
-                if self.code_extents.borrow().len() > 0xffffffffusize {
-                    bug!() // should pass a sess,
-                           // but this isn't the only place
-                }
-                let idx = CodeExtent(self.code_extents.borrow().len() as u32);
-                debug!("CodeExtent({}) = {:?} [parent={}]", idx.0, e, parent.0);
-                self.code_extents.borrow_mut().push(e);
-                self.scope_map.borrow_mut().push(parent);
-                *v.insert(idx)
-            }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr) {
+        debug!("ExprLocatorVisitor - pre-increment {} expr = {:?}",
+               self.expr_and_pat_count,
+               expr);
+
+        intravisit::walk_expr(self, expr);
+
+        self.expr_and_pat_count += 1;
+
+        debug!("ExprLocatorVisitor - post-increment {} expr = {:?}",
+               self.expr_and_pat_count,
+               expr);
+
+        if expr.hir_id == self.hir_id {
+            self.result = Some(self.expr_and_pat_count);
         }
     }
-    pub fn intern_node(&self,
-                       n: ast::NodeId,
-                       parent: CodeExtent) -> CodeExtent {
-        self.intern_code_extent(CodeExtentData::Misc(n), parent)
-    }
-    pub fn code_extent_data(&self, e: CodeExtent) -> CodeExtentData {
-        self.code_extents.borrow()[e.0 as usize]
-    }
-    pub fn each_encl_scope<E>(&self, mut e:E) where E: FnMut(&CodeExtent, &CodeExtent) {
-        for child_id in 1..self.code_extents.borrow().len() {
-            let child = CodeExtent(child_id as u32);
-            if let Some(parent) = self.opt_encl_scope(child) {
-                e(&child, &parent)
-            }
+}
+
+impl<'tcx> ScopeTree {
+    pub fn record_scope_parent(&mut self, child: Scope, parent: Option<(Scope, ScopeDepth)>) {
+        debug!("{:?}.parent = {:?}", child, parent);
+
+        if let Some(p) = parent {
+            let prev = self.parent_map.insert(child, p);
+            assert!(prev.is_none());
+        }
+
+        // Record the destruction scopes for later so we can query them.
+        if let ScopeData::Destruction = child.data {
+            self.destruction_scopes.insert(child.item_local_id(), child);
         }
     }
-    pub fn each_var_scope<E>(&self, mut e:E) where E: FnMut(&ast::NodeId, &CodeExtent) {
-        for (child, parent) in self.var_map.borrow().iter() {
+
+    pub fn each_encl_scope<E>(&self, mut e: E) where E: FnMut(Scope, Scope) {
+        for (&child, &parent) in &self.parent_map {
+            e(child, parent.0)
+        }
+    }
+
+    pub fn each_var_scope<E>(&self, mut e: E) where E: FnMut(&hir::ItemLocalId, Scope) {
+        for (child, &parent) in self.var_map.iter() {
             e(child, parent)
         }
     }
-    pub fn each_rvalue_scope<E>(&self, mut e:E) where E: FnMut(&ast::NodeId, &CodeExtent) {
-        for (child, parent) in self.rvalue_scopes.borrow().iter() {
-            e(child, parent)
-        }
+
+    pub fn opt_destruction_scope(&self, n: hir::ItemLocalId) -> Option<Scope> {
+        self.destruction_scopes.get(&n).cloned()
     }
-    /// Records that `sub_fn` is defined within `sup_fn`. These ids
-    /// should be the id of the block that is the fn body, which is
+
+    /// Records that `sub_closure` is defined within `sup_closure`. These IDs
+    /// should be the ID of the block that is the fn body, which is
     /// also the root of the region hierarchy for that fn.
-    fn record_fn_parent(&self, sub_fn: ast::NodeId, sup_fn: ast::NodeId) {
-        debug!("record_fn_parent(sub_fn={:?}, sup_fn={:?})", sub_fn, sup_fn);
-        assert!(sub_fn != sup_fn);
-        let previous = self.fn_tree.borrow_mut().insert(sub_fn, sup_fn);
+    fn record_closure_parent(&mut self,
+                             sub_closure: hir::ItemLocalId,
+                             sup_closure: hir::ItemLocalId) {
+        debug!("record_closure_parent(sub_closure={:?}, sup_closure={:?})",
+               sub_closure, sup_closure);
+        assert!(sub_closure != sup_closure);
+        let previous = self.closure_tree.insert(sub_closure, sup_closure);
         assert!(previous.is_none());
     }
 
-    fn fn_is_enclosed_by(&self, mut sub_fn: ast::NodeId, sup_fn: ast::NodeId) -> bool {
-        let fn_tree = self.fn_tree.borrow();
-        loop {
-            if sub_fn == sup_fn { return true; }
-            match fn_tree.get(&sub_fn) {
-                Some(&s) => { sub_fn = s; }
-                None => { return false; }
-            }
-        }
-    }
-
-    fn record_var_scope(&self, var: ast::NodeId, lifetime: CodeExtent) {
+    fn record_var_scope(&mut self, var: hir::ItemLocalId, lifetime: Scope) {
         debug!("record_var_scope(sub={:?}, sup={:?})", var, lifetime);
-        assert!(var != lifetime.node_id(self));
-        self.var_map.borrow_mut().insert(var, lifetime);
+        assert!(var != lifetime.item_local_id());
+        self.var_map.insert(var, lifetime);
     }
 
-    fn record_rvalue_scope(&self, var: ast::NodeId, lifetime: CodeExtent) {
+    fn record_rvalue_scope(&mut self, var: hir::ItemLocalId, lifetime: Option<Scope>) {
         debug!("record_rvalue_scope(sub={:?}, sup={:?})", var, lifetime);
-        assert!(var != lifetime.node_id(self));
-        self.rvalue_scopes.borrow_mut().insert(var, lifetime);
+        if let Some(lifetime) = lifetime {
+            assert!(var != lifetime.item_local_id());
+        }
+        self.rvalue_scopes.insert(var, lifetime);
     }
 
-    pub fn opt_encl_scope(&self, id: CodeExtent) -> Option<CodeExtent> {
-        //! Returns the narrowest scope that encloses `id`, if any.
-        self.scope_map.borrow()[id.0 as usize].into_option()
+    /// Returns the narrowest scope that encloses `id`, if any.
+    pub fn opt_encl_scope(&self, id: Scope) -> Option<Scope> {
+        self.parent_map.get(&id).cloned().map(|(p, _)| p)
     }
 
+    /// Returns the narrowest scope that encloses `id`, if any.
     #[allow(dead_code)] // used in cfg
-    pub fn encl_scope(&self, id: CodeExtent) -> CodeExtent {
-        //! Returns the narrowest scope that encloses `id`, if any.
+    pub fn encl_scope(&self, id: Scope) -> Scope {
         self.opt_encl_scope(id).unwrap()
     }
 
     /// Returns the lifetime of the local variable `var_id`
-    pub fn var_scope(&self, var_id: ast::NodeId) -> CodeExtent {
-        match self.var_map.borrow().get(&var_id) {
-            Some(&r) => r,
-            None => { bug!("no enclosing scope for id {:?}", var_id); }
-        }
+    pub fn var_scope(&self, var_id: hir::ItemLocalId) -> Scope {
+        self.var_map.get(&var_id).cloned().unwrap_or_else(||
+            bug!("no enclosing scope for id {:?}", var_id))
     }
 
-    pub fn temporary_scope(&self, expr_id: ast::NodeId) -> Option<CodeExtent> {
-        //! Returns the scope when temp created by expr_id will be cleaned up
-
-        // check for a designated rvalue scope
-        if let Some(&s) = self.rvalue_scopes.borrow().get(&expr_id) {
+    /// Returns the scope when the temp created by `expr_id` will be cleaned up.
+    pub fn temporary_scope(&self, expr_id: hir::ItemLocalId) -> Option<Scope> {
+        // Check for a designated rvalue scope.
+        if let Some(&s) = self.rvalue_scopes.get(&expr_id) {
             debug!("temporary_scope({:?}) = {:?} [custom]", expr_id, s);
-            return Some(s);
+            return s;
         }
 
-        let scope_map : &[CodeExtent] = &self.scope_map.borrow();
-        let code_extents: &[CodeExtentData] = &self.code_extents.borrow();
-
-        // else, locate the innermost terminating scope
+        // Otherwise, locate the innermost terminating scope
         // if there's one. Static items, for instance, won't
         // have an enclosing scope, hence no scope will be
         // returned.
-        let mut id = self.node_extent(expr_id);
+        let mut id = Scope { id: expr_id, data: ScopeData::Node };
 
-        while let Some(p) = scope_map[id.0 as usize].into_option() {
-            match code_extents[p.0 as usize] {
-                CodeExtentData::DestructionScope(..) => {
+        while let Some(&(p, _)) = self.parent_map.get(&id) {
+            match p.data {
+                ScopeData::Destruction => {
                     debug!("temporary_scope({:?}) = {:?} [enclosing]",
                            expr_id, id);
                     return Some(id);
@@ -509,25 +549,23 @@ impl RegionMaps {
         return None;
     }
 
-    pub fn var_region(&self, id: ast::NodeId) -> ty::Region {
-        //! Returns the lifetime of the variable `id`.
-
+    /// Returns the lifetime of the variable `id`.
+    pub fn var_region(&self, id: hir::ItemLocalId) -> ty::RegionKind {
         let scope = ty::ReScope(self.var_scope(id));
         debug!("var_region({:?}) = {:?}", id, scope);
         scope
     }
 
-    pub fn scopes_intersect(&self, scope1: CodeExtent, scope2: CodeExtent)
-                            -> bool {
+    pub fn scopes_intersect(&self, scope1: Scope, scope2: Scope) -> bool {
         self.is_subscope_of(scope1, scope2) ||
         self.is_subscope_of(scope2, scope1)
     }
 
-    /// Returns true if `subscope` is equal to or is lexically nested inside `superscope` and false
-    /// otherwise.
+    /// Returns `true` if `subscope` is equal to or is lexically nested inside `superscope`, and
+    /// `false` otherwise.
     pub fn is_subscope_of(&self,
-                          subscope: CodeExtent,
-                          superscope: CodeExtent)
+                          subscope: Scope,
+                          superscope: Scope)
                           -> bool {
         let mut s = subscope;
         debug!("is_subscope_of({:?}, {:?})", subscope, superscope);
@@ -542,131 +580,186 @@ impl RegionMaps {
             }
         }
 
-        debug!("is_subscope_of({:?}, {:?})=true",
-               subscope, superscope);
+        debug!("is_subscope_of({:?}, {:?})=true", subscope, superscope);
 
         return true;
     }
 
-    /// Finds the nearest common ancestor (if any) of two scopes.  That is, finds the smallest
-    /// scope which is greater than or equal to both `scope_a` and `scope_b`.
-    pub fn nearest_common_ancestor(&self,
-                                   scope_a: CodeExtent,
-                                   scope_b: CodeExtent)
-                                   -> CodeExtent {
+    /// Returns the ID of the innermost containing body.
+    pub fn containing_body(&self, mut scope: Scope) -> Option<hir::ItemLocalId> {
+        loop {
+            if let ScopeData::CallSite = scope.data {
+                return Some(scope.item_local_id());
+            }
+
+            scope = self.opt_encl_scope(scope)?;
+        }
+    }
+
+    /// Finds the nearest common ancestor of two scopes. That is, finds the
+    /// smallest scope which is greater than or equal to both `scope_a` and
+    /// `scope_b`.
+    pub fn nearest_common_ancestor(&self, scope_a: Scope, scope_b: Scope) -> Scope {
         if scope_a == scope_b { return scope_a; }
 
-        let mut a_buf: [CodeExtent; 32] = [ROOT_CODE_EXTENT; 32];
-        let mut a_vec: Vec<CodeExtent> = vec![];
-        let mut b_buf: [CodeExtent; 32] = [ROOT_CODE_EXTENT; 32];
-        let mut b_vec: Vec<CodeExtent> = vec![];
-        let scope_map : &[CodeExtent] = &self.scope_map.borrow();
-        let a_ancestors = ancestors_of(scope_map,
-                                       scope_a, &mut a_buf, &mut a_vec);
-        let b_ancestors = ancestors_of(scope_map,
-                                       scope_b, &mut b_buf, &mut b_vec);
-        let mut a_index = a_ancestors.len() - 1;
-        let mut b_index = b_ancestors.len() - 1;
+        let mut a = scope_a;
+        let mut b = scope_b;
 
-        // Here, [ab]_ancestors is a vector going from narrow to broad.
-        // The end of each vector will be the item where the scope is
-        // defined; if there are any common ancestors, then the tails of
-        // the vector will be the same.  So basically we want to walk
-        // backwards from the tail of each vector and find the first point
-        // where they diverge.  If one vector is a suffix of the other,
-        // then the corresponding scope is a superscope of the other.
+        // Get the depth of each scope's parent. If either scope has no parent,
+        // it must be the root, which means we can stop immediately because the
+        // root must be the nearest common ancestor. (In practice, this is
+        // moderately common.)
+        let (parent_a, parent_a_depth) = match self.parent_map.get(&a) {
+            Some(pd) => *pd,
+            None => return a,
+        };
+        let (parent_b, parent_b_depth) = match self.parent_map.get(&b) {
+            Some(pd) => *pd,
+            None => return b,
+        };
 
-        if a_ancestors[a_index] != b_ancestors[b_index] {
-            // In this case, the two regions belong to completely
-            // different functions.  Compare those fn for lexical
-            // nesting. The reasoning behind this is subtle.  See the
-            // "Modeling closures" section of the README in
-            // infer::region_inference for more details.
-            let a_root_scope = self.code_extent_data(a_ancestors[a_index]);
-            let b_root_scope = self.code_extent_data(a_ancestors[a_index]);
-            return match (a_root_scope, b_root_scope) {
-                (CodeExtentData::DestructionScope(a_root_id),
-                 CodeExtentData::DestructionScope(b_root_id)) => {
-                    if self.fn_is_enclosed_by(a_root_id, b_root_id) {
-                        // `a` is enclosed by `b`, hence `b` is the ancestor of everything in `a`
-                        scope_b
-                    } else if self.fn_is_enclosed_by(b_root_id, a_root_id) {
-                        // `b` is enclosed by `a`, hence `a` is the ancestor of everything in `b`
-                        scope_a
-                    } else {
-                        // neither fn encloses the other
-                        bug!()
-                    }
-                }
-                _ => {
-                    // root ids are always Misc right now
-                    bug!()
-                }
+        if parent_a_depth > parent_b_depth {
+            // `a` is lower than `b`. Move `a` up until it's at the same depth
+            // as `b`. The first move up is trivial because we already found
+            // `parent_a` above; the loop does the remaining N-1 moves.
+            a = parent_a;
+            for _ in 0..(parent_a_depth - parent_b_depth - 1) {
+                a = self.parent_map.get(&a).unwrap().0;
+            }
+        } else if parent_b_depth > parent_a_depth {
+            // `b` is lower than `a`.
+            b = parent_b;
+            for _ in 0..(parent_b_depth - parent_a_depth - 1) {
+                b = self.parent_map.get(&b).unwrap().0;
+            }
+        } else {
+            // Both scopes are at the same depth, and we know they're not equal
+            // because that case was tested for at the top of this function. So
+            // we can trivially move them both up one level now.
+            assert!(parent_a_depth != 0);
+            a = parent_a;
+            b = parent_b;
+        }
+
+        // Now both scopes are at the same level. We move upwards in lockstep
+        // until they match. In practice, this loop is almost always executed
+        // zero times because `a` is almost always a direct ancestor of `b` or
+        // vice versa.
+        while a != b {
+            a = self.parent_map.get(&a).unwrap().0;
+            b = self.parent_map.get(&b).unwrap().0;
+        };
+
+        a
+    }
+
+    /// Assuming that the provided region was defined within this `ScopeTree`,
+    /// returns the outermost `Scope` that the region outlives.
+    pub fn early_free_scope(&self, tcx: TyCtxt<'tcx>, br: &ty::EarlyBoundRegion) -> Scope {
+        let param_owner = tcx.parent(br.def_id).unwrap();
+
+        let param_owner_id = tcx.hir().as_local_hir_id(param_owner).unwrap();
+        let scope = tcx.hir().maybe_body_owned_by(param_owner_id).map(|body_id| {
+            tcx.hir().body(body_id).value.hir_id.local_id
+        }).unwrap_or_else(|| {
+            // The lifetime was defined on node that doesn't own a body,
+            // which in practice can only mean a trait or an impl, that
+            // is the parent of a method, and that is enforced below.
+            if Some(param_owner_id) != self.root_parent {
+                tcx.sess.delay_span_bug(
+                    DUMMY_SP,
+                    &format!("free_scope: {:?} not recognized by the \
+                              region scope tree for {:?} / {:?}",
+                             param_owner,
+                             self.root_parent.map(|id| tcx.hir().local_def_id(id)),
+                             self.root_body.map(|hir_id| DefId::local(hir_id.owner))));
+            }
+
+            // The trait/impl lifetime is in scope for the method's body.
+            self.root_body.unwrap().local_id
+        });
+
+        Scope { id: scope, data: ScopeData::CallSite }
+    }
+
+    /// Assuming that the provided region was defined within this `ScopeTree`,
+    /// returns the outermost `Scope` that the region outlives.
+    pub fn free_scope(&self, tcx: TyCtxt<'tcx>, fr: &ty::FreeRegion) -> Scope {
+        let param_owner = match fr.bound_region {
+            ty::BoundRegion::BrNamed(def_id, _) => {
+                tcx.parent(def_id).unwrap()
+            }
+            _ => fr.scope
+        };
+
+        // Ensure that the named late-bound lifetimes were defined
+        // on the same function that they ended up being freed in.
+        assert_eq!(param_owner, fr.scope);
+
+        let param_owner_id = tcx.hir().as_local_hir_id(param_owner).unwrap();
+        let body_id = tcx.hir().body_owned_by(param_owner_id);
+        Scope { id: tcx.hir().body(body_id).value.hir_id.local_id, data: ScopeData::CallSite }
+    }
+
+    /// Checks whether the given scope contains a `yield`. If so,
+    /// returns `Some((span, expr_count))` with the span of a yield we found and
+    /// the number of expressions and patterns appearing before the `yield` in the body + 1.
+    /// If there a are multiple yields in a scope, the one with the highest number is returned.
+    pub fn yield_in_scope(&self, scope: Scope) -> Option<YieldData> {
+        self.yield_in_scope.get(&scope).cloned()
+    }
+
+    /// Checks whether the given scope contains a `yield` and if that yield could execute
+    /// after `expr`. If so, it returns the span of that `yield`.
+    /// `scope` must be inside the body.
+    pub fn yield_in_scope_for_expr(&self,
+                                   scope: Scope,
+                                   expr_hir_id: hir::HirId,
+                                   body: &'tcx hir::Body) -> Option<Span> {
+        self.yield_in_scope(scope).and_then(|YieldData { span, expr_and_pat_count, .. }| {
+            let mut visitor = ExprLocatorVisitor {
+                hir_id: expr_hir_id,
+                result: None,
+                expr_and_pat_count: 0,
             };
-        }
-
-        loop {
-            // Loop invariant: a_ancestors[a_index] == b_ancestors[b_index]
-            // for all indices between a_index and the end of the array
-            if a_index == 0 { return scope_a; }
-            if b_index == 0 { return scope_b; }
-            a_index -= 1;
-            b_index -= 1;
-            if a_ancestors[a_index] != b_ancestors[b_index] {
-                return a_ancestors[a_index + 1];
+            visitor.visit_body(body);
+            if expr_and_pat_count >= visitor.result.unwrap() {
+                Some(span)
+            } else {
+                None
             }
-        }
+        })
+    }
 
-        fn ancestors_of<'a>(scope_map: &[CodeExtent],
-                            scope: CodeExtent,
-                            buf: &'a mut [CodeExtent; 32],
-                            vec: &'a mut Vec<CodeExtent>) -> &'a [CodeExtent] {
-            // debug!("ancestors_of(scope={:?})", scope);
-            let mut scope = scope;
-
-            let mut i = 0;
-            while i < 32 {
-                buf[i] = scope;
-                match scope_map[scope.0 as usize].into_option() {
-                    Some(superscope) => scope = superscope,
-                    _ => return &buf[..i+1]
-                }
-                i += 1;
-            }
-
-            *vec = Vec::with_capacity(64);
-            vec.extend_from_slice(buf);
-            loop {
-                vec.push(scope);
-                match scope_map[scope.0 as usize].into_option() {
-                    Some(superscope) => scope = superscope,
-                    _ => return &*vec
-                }
-            }
-        }
+    /// Gives the number of expressions visited in a body.
+    /// Used to sanity check visit_expr call count when
+    /// calculating generator interiors.
+    pub fn body_expr_count(&self, body_id: hir::BodyId) -> Option<usize> {
+        self.body_expr_count.get(&body_id).map(|r| *r)
     }
 }
 
 /// Records the lifetime of a local variable as `cx.var_parent`
-fn record_var_lifetime(visitor: &mut RegionResolutionVisitor,
-                       var_id: ast::NodeId,
-                       _sp: Span) {
+fn record_var_lifetime(
+    visitor: &mut RegionResolutionVisitor<'_>,
+    var_id: hir::ItemLocalId,
+    _sp: Span,
+) {
     match visitor.cx.var_parent {
-        ROOT_CODE_EXTENT => {
+        None => {
             // this can happen in extern fn declarations like
             //
             // extern fn isalnum(c: c_int) -> c_int
         }
-        parent_scope =>
-            visitor.region_maps.record_var_scope(var_id, parent_scope),
+        Some((parent_scope, _)) =>
+            visitor.scope_tree.record_var_scope(var_id, parent_scope),
     }
 }
 
-fn resolve_block<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, blk: &'tcx hir::Block) {
-    debug!("resolve_block(blk.id={:?})", blk.id);
+fn resolve_block<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, blk: &'tcx hir::Block) {
+    debug!("resolve_block(blk.hir_id={:?})", blk.hir_id);
 
     let prev_cx = visitor.cx;
-    let block_extent = visitor.new_node_extent_with_dtor(blk.id);
 
     // We treat the tail expression in the block (if any) somewhat
     // differently from the statements. The issue has to do with
@@ -679,10 +772,10 @@ fn resolve_block<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, blk:
     //    }, other_argument());
     //
     // Each of the statements within the block is a terminating
-    // scope, and thus a temporary (e.g. the result of calling
-    // `bar()` in the initalizer expression for `let inner = ...;`)
+    // scope, and thus a temporary (e.g., the result of calling
+    // `bar()` in the initializer expression for `let inner = ...;`)
     // will be cleaned up immediately after its corresponding
-    // statement (i.e. `let inner = ...;`) executes.
+    // statement (i.e., `let inner = ...;`) executes.
     //
     // On the other hand, temporaries associated with evaluating the
     // tail expression for the block are assigned lifetimes so that
@@ -693,11 +786,8 @@ fn resolve_block<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, blk:
     // `other_argument()` has run and also the call to `quux(..)`
     // itself has returned.
 
-    visitor.cx = Context {
-        root_id: prev_cx.root_id,
-        var_parent: block_extent,
-        parent: block_extent,
-    };
+    visitor.enter_node_scope_with_dtor(blk.hir_id.local_id);
+    visitor.cx.var_parent = visitor.cx.parent;
 
     {
         // This block should be kept approximately in sync with
@@ -706,24 +796,25 @@ fn resolve_block<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, blk:
         // index information.)
 
         for (i, statement) in blk.stmts.iter().enumerate() {
-            if let hir::StmtDecl(..) = statement.node {
-                // Each StmtDecl introduces a subscope for bindings
-                // introduced by the declaration; this subscope covers
-                // a suffix of the block . Each subscope in a block
-                // has the previous subscope in the block as a parent,
-                // except for the first such subscope, which has the
-                // block itself as a parent.
-                let stmt_extent = visitor.new_code_extent(
-                    CodeExtentData::Remainder(BlockRemainder {
-                        block: blk.id,
-                        first_statement_index: i as u32
-                    })
-                );
-                visitor.cx = Context {
-                    root_id: prev_cx.root_id,
-                    var_parent: stmt_extent,
-                    parent: stmt_extent,
-                };
+            match statement.kind {
+                hir::StmtKind::Local(..) |
+                hir::StmtKind::Item(..) => {
+                    // Each declaration introduces a subscope for bindings
+                    // introduced by the declaration; this subscope covers a
+                    // suffix of the block. Each subscope in a block has the
+                    // previous subscope in the block as a parent, except for
+                    // the first such subscope, which has the block itself as a
+                    // parent.
+                    visitor.enter_scope(
+                        Scope {
+                            id: blk.hir_id.local_id,
+                            data: ScopeData::Remainder(FirstStatementIndex::new(i))
+                        }
+                    );
+                    visitor.cx.var_parent = visitor.cx.parent;
+                }
+                hir::StmtKind::Expr(..) |
+                hir::StmtKind::Semi(..) => {}
             }
             visitor.visit_stmt(statement)
         }
@@ -733,96 +824,102 @@ fn resolve_block<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, blk:
     visitor.cx = prev_cx;
 }
 
-fn resolve_arm<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, arm: &'tcx hir::Arm) {
-    visitor.terminating_scopes.insert(arm.body.id);
+fn resolve_arm<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, arm: &'tcx hir::Arm) {
+    let prev_cx = visitor.cx;
 
-    if let Some(ref expr) = arm.guard {
-        visitor.terminating_scopes.insert(expr.id);
+    visitor.enter_scope(
+        Scope {
+            id: arm.hir_id.local_id,
+            data: ScopeData::Node,
+        }
+    );
+    visitor.cx.var_parent = visitor.cx.parent;
+
+    visitor.terminating_scopes.insert(arm.body.hir_id.local_id);
+
+    if let Some(hir::Guard::If(ref expr)) = arm.guard {
+        visitor.terminating_scopes.insert(expr.hir_id.local_id);
     }
 
     intravisit::walk_arm(visitor, arm);
+
+    visitor.cx = prev_cx;
 }
 
-fn resolve_pat<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, pat: &'tcx hir::Pat) {
-    visitor.new_node_extent(pat.id);
+fn resolve_pat<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, pat: &'tcx hir::Pat) {
+    visitor.record_child_scope(Scope { id: pat.hir_id.local_id, data: ScopeData::Node });
 
     // If this is a binding then record the lifetime of that binding.
-    if let PatKind::Binding(..) = pat.node {
-        record_var_lifetime(visitor, pat.id, pat.span);
+    if let PatKind::Binding(..) = pat.kind {
+        record_var_lifetime(visitor, pat.hir_id.local_id, pat.span);
     }
 
+    debug!("resolve_pat - pre-increment {} pat = {:?}", visitor.expr_and_pat_count, pat);
+
     intravisit::walk_pat(visitor, pat);
+
+    visitor.expr_and_pat_count += 1;
+
+    debug!("resolve_pat - post-increment {} pat = {:?}", visitor.expr_and_pat_count, pat);
 }
 
-fn resolve_stmt<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, stmt: &'tcx hir::Stmt) {
-    let stmt_id = stmt.node.id();
+fn resolve_stmt<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, stmt: &'tcx hir::Stmt) {
+    let stmt_id = stmt.hir_id.local_id;
     debug!("resolve_stmt(stmt.id={:?})", stmt_id);
 
     // Every statement will clean up the temporaries created during
     // execution of that statement. Therefore each statement has an
-    // associated destruction scope that represents the extent of the
-    // statement plus its destructors, and thus the extent for which
+    // associated destruction scope that represents the scope of the
+    // statement plus its destructors, and thus the scope for which
     // regions referenced by the destructors need to survive.
     visitor.terminating_scopes.insert(stmt_id);
-    let stmt_extent = visitor.new_node_extent_with_dtor(stmt_id);
 
     let prev_parent = visitor.cx.parent;
-    visitor.cx.parent = stmt_extent;
+    visitor.enter_node_scope_with_dtor(stmt_id);
+
     intravisit::walk_stmt(visitor, stmt);
+
     visitor.cx.parent = prev_parent;
 }
 
-fn resolve_expr<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, expr: &'tcx hir::Expr) {
-    debug!("resolve_expr(expr.id={:?})", expr.id);
+fn resolve_expr<'tcx>(visitor: &mut RegionResolutionVisitor<'tcx>, expr: &'tcx hir::Expr) {
+    debug!("resolve_expr - pre-increment {} expr = {:?}", visitor.expr_and_pat_count, expr);
 
-    let expr_extent = visitor.new_node_extent_with_dtor(expr.id);
     let prev_cx = visitor.cx;
-    visitor.cx.parent = expr_extent;
+    visitor.enter_node_scope_with_dtor(expr.hir_id.local_id);
 
     {
         let terminating_scopes = &mut visitor.terminating_scopes;
-        let mut terminating = |id: ast::NodeId| {
+        let mut terminating = |id: hir::ItemLocalId| {
             terminating_scopes.insert(id);
         };
-        match expr.node {
+        match expr.kind {
             // Conditional or repeating scopes are always terminating
             // scopes, meaning that temporaries cannot outlive them.
             // This ensures fixed size stacks.
 
-            hir::ExprBinary(codemap::Spanned { node: hir::BiAnd, .. }, _, ref r) |
-            hir::ExprBinary(codemap::Spanned { node: hir::BiOr, .. }, _, ref r) => {
-                // For shortcircuiting operators, mark the RHS as a terminating
-                // scope since it only executes conditionally.
-                terminating(r.id);
+            hir::ExprKind::Binary(
+                source_map::Spanned { node: hir::BinOpKind::And, .. }, _, ref r) |
+            hir::ExprKind::Binary(
+                source_map::Spanned { node: hir::BinOpKind::Or, .. }, _, ref r) => {
+                    // For shortcircuiting operators, mark the RHS as a terminating
+                    // scope since it only executes conditionally.
+                    terminating(r.hir_id.local_id);
             }
 
-            hir::ExprIf(ref expr, ref then, Some(ref otherwise)) => {
-                terminating(expr.id);
-                terminating(then.id);
-                terminating(otherwise.id);
+            hir::ExprKind::Loop(ref body, _, _) => {
+                terminating(body.hir_id.local_id);
             }
 
-            hir::ExprIf(ref expr, ref then, None) => {
-                terminating(expr.id);
-                terminating(then.id);
+            hir::ExprKind::DropTemps(ref expr) => {
+                // `DropTemps(expr)` does not denote a conditional scope.
+                // Rather, we want to achieve the same behavior as `{ let _t = expr; _t }`.
+                terminating(expr.hir_id.local_id);
             }
 
-            hir::ExprLoop(ref body, _, _) => {
-                terminating(body.id);
-            }
-
-            hir::ExprWhile(ref expr, ref body, _) => {
-                terminating(expr.id);
-                terminating(body.id);
-            }
-
-            hir::ExprMatch(..) => {
-                visitor.cx.var_parent = expr_extent;
-            }
-
-            hir::ExprAssignOp(..) | hir::ExprIndex(..) |
-            hir::ExprUnary(..) | hir::ExprCall(..) | hir::ExprMethodCall(..) => {
-                // FIXME(#6268) Nested method calls
+            hir::ExprKind::AssignOp(..) | hir::ExprKind::Index(..) |
+            hir::ExprKind::Unary(..) | hir::ExprKind::Call(..) | hir::ExprKind::MethodCall(..) => {
+                // FIXME(https://github.com/rust-lang/rfcs/issues/811) Nested method calls
                 //
                 // The lifetimes for a call or method call look as follows:
                 //
@@ -846,25 +943,158 @@ fn resolve_expr<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>, expr:
         }
     }
 
-    intravisit::walk_expr(visitor, expr);
+    let prev_pessimistic = visitor.pessimistic_yield;
+
+    // Ordinarily, we can rely on the visit order of HIR intravisit
+    // to correspond to the actual execution order of statements.
+    // However, there's a weird corner case with compund assignment
+    // operators (e.g. `a += b`). The evaluation order depends on whether
+    // or not the operator is overloaded (e.g. whether or not a trait
+    // like AddAssign is implemented).
+
+    // For primitive types (which, despite having a trait impl, don't actually
+    // end up calling it), the evluation order is right-to-left. For example,
+    // the following code snippet:
+    //
+    //    let y = &mut 0;
+    //    *{println!("LHS!"); y} += {println!("RHS!"); 1};
+    //
+    // will print:
+    //
+    // RHS!
+    // LHS!
+    //
+    // However, if the operator is used on a non-primitive type,
+    // the evaluation order will be left-to-right, since the operator
+    // actually get desugared to a method call. For example, this
+    // nearly identical code snippet:
+    //
+    //     let y = &mut String::new();
+    //    *{println!("LHS String"); y} += {println!("RHS String"); "hi"};
+    //
+    // will print:
+    // LHS String
+    // RHS String
+    //
+    // To determine the actual execution order, we need to perform
+    // trait resolution. Unfortunately, we need to be able to compute
+    // yield_in_scope before type checking is even done, as it gets
+    // used by AST borrowcheck.
+    //
+    // Fortunately, we don't need to know the actual execution order.
+    // It suffices to know the 'worst case' order with respect to yields.
+    // Specifically, we need to know the highest 'expr_and_pat_count'
+    // that we could assign to the yield expression. To do this,
+    // we pick the greater of the two values from the left-hand
+    // and right-hand expressions. This makes us overly conservative
+    // about what types could possibly live across yield points,
+    // but we will never fail to detect that a type does actually
+    // live across a yield point. The latter part is critical -
+    // we're already overly conservative about what types will live
+    // across yield points, as the generated MIR will determine
+    // when things are actually live. However, for typecheck to work
+    // properly, we can't miss any types.
+
+
+    match expr.kind {
+        // Manually recurse over closures, because they are the only
+        // case of nested bodies that share the parent environment.
+        hir::ExprKind::Closure(.., body, _, _) => {
+            let body = visitor.tcx.hir().body(body);
+            visitor.visit_body(body);
+        },
+        hir::ExprKind::AssignOp(_, ref left_expr, ref right_expr) => {
+            debug!("resolve_expr - enabling pessimistic_yield, was previously {}",
+                   prev_pessimistic);
+
+            let start_point = visitor.fixup_scopes.len();
+            visitor.pessimistic_yield = true;
+
+            // If the actual execution order turns out to be right-to-left,
+            // then we're fine. However, if the actual execution order is left-to-right,
+            // then we'll assign too low a count to any `yield` expressions
+            // we encounter in 'right_expression' - they should really occur after all of the
+            // expressions in 'left_expression'.
+            visitor.visit_expr(&right_expr);
+            visitor.pessimistic_yield = prev_pessimistic;
+
+            debug!("resolve_expr - restoring pessimistic_yield to {}", prev_pessimistic);
+            visitor.visit_expr(&left_expr);
+            debug!("resolve_expr - fixing up counts to {}", visitor.expr_and_pat_count);
+
+            // Remove and process any scopes pushed by the visitor
+            let target_scopes = visitor.fixup_scopes.drain(start_point..);
+
+            for scope in target_scopes {
+                let mut yield_data = visitor.scope_tree.yield_in_scope.get_mut(&scope).unwrap();
+                let count = yield_data.expr_and_pat_count;
+                let span = yield_data.span;
+
+                // expr_and_pat_count never decreases. Since we recorded counts in yield_in_scope
+                // before walking the left-hand side, it should be impossible for the recorded
+                // count to be greater than the left-hand side count.
+                if count > visitor.expr_and_pat_count {
+                    bug!("Encountered greater count {} at span {:?} - expected no greater than {}",
+                         count, span, visitor.expr_and_pat_count);
+                }
+                let new_count = visitor.expr_and_pat_count;
+                debug!("resolve_expr - increasing count for scope {:?} from {} to {} at span {:?}",
+                       scope, count, new_count, span);
+
+                yield_data.expr_and_pat_count = new_count;
+            }
+
+        }
+
+        _ => intravisit::walk_expr(visitor, expr)
+    }
+
+    visitor.expr_and_pat_count += 1;
+
+    debug!("resolve_expr post-increment {}, expr = {:?}", visitor.expr_and_pat_count, expr);
+
+    if let hir::ExprKind::Yield(_, source) = &expr.kind {
+        // Mark this expr's scope and all parent scopes as containing `yield`.
+        let mut scope = Scope { id: expr.hir_id.local_id, data: ScopeData::Node };
+        loop {
+            let data = YieldData {
+                span: expr.span,
+                expr_and_pat_count: visitor.expr_and_pat_count,
+                source: *source,
+            };
+            visitor.scope_tree.yield_in_scope.insert(scope, data);
+            if visitor.pessimistic_yield {
+                debug!("resolve_expr in pessimistic_yield - marking scope {:?} for fixup", scope);
+                visitor.fixup_scopes.push(scope);
+            }
+
+            // Keep traversing up while we can.
+            match visitor.scope_tree.parent_map.get(&scope) {
+                // Don't cross from closure bodies to their parent.
+                Some(&(superscope, _)) => match superscope.data {
+                    ScopeData::CallSite => break,
+                    _ => scope = superscope
+                },
+                None => break
+            }
+        }
+    }
+
     visitor.cx = prev_cx;
 }
 
-fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
-                           local: &'tcx hir::Local) {
-    debug!("resolve_local(local.id={:?},local.init={:?})",
-           local.id,local.init.is_some());
+fn resolve_local<'tcx>(
+    visitor: &mut RegionResolutionVisitor<'tcx>,
+    pat: Option<&'tcx hir::Pat>,
+    init: Option<&'tcx hir::Expr>,
+) {
+    debug!("resolve_local(pat={:?}, init={:?})", pat, init);
 
-    // For convenience in trans, associate with the local-id the var
-    // scope that will be used for any bindings declared in this
-    // pattern.
-    let blk_scope = visitor.cx.var_parent;
-    assert!(blk_scope != ROOT_CODE_EXTENT); // locals must be within a block
-    visitor.region_maps.record_var_scope(local.id, blk_scope);
+    let blk_scope = visitor.cx.var_parent.map(|(p, _)| p);
 
     // As an exception to the normal rules governing temporary
     // lifetimes, initializers in a let have a temporary lifetime
-    // of the enclosing block. This means that e.g. a program
+    // of the enclosing block. This means that e.g., a program
     // like the following is legal:
     //
     //     let ref x = HashMap::new();
@@ -884,7 +1114,7 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     //    I mean that creating a binding into a ref-counted or managed value
     //    would still count.)
     //
-    // 3. `ET`, which matches both rvalues like `foo()` as well as lvalues
+    // 3. `ET`, which matches both rvalues like `foo()` as well as places
     //    based on rvalues like `foo().x[2].y`.
     //
     // A subexpression `<rvalue>` that appears in a let initializer
@@ -906,10 +1136,7 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     // Rule A. `let (ref x, ref y) = (foo().x, 44)`. The rvalue `(22, 44)`
     // would have an extended lifetime, but not `foo()`.
     //
-    // Rule B. `let x: &[...] = [foo().x]`. The rvalue `[foo().x]`
-    // would have an extended lifetime, but not `foo()`.
-    //
-    // Rule C. `let x = &foo().x`. The rvalue ``foo()` would have extended
+    // Rule B. `let x = &foo().x`. The rvalue `foo()` would have extended
     // lifetime.
     //
     // In some cases, multiple rules may apply (though not to the same
@@ -920,23 +1147,26 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     // Here, the expression `[...]` has an extended lifetime due to rule
     // A, but the inner rvalues `a()` and `b()` have an extended lifetime
     // due to rule C.
-    //
-    // FIXME(#6308) -- Note that `[]` patterns work more smoothly post-DST.
 
-    if let Some(ref expr) = local.init {
+    if let Some(expr) = init {
         record_rvalue_scope_if_borrow_expr(visitor, &expr, blk_scope);
 
-        let is_borrow =
-            if let Some(ref ty) = local.ty { is_borrowed_ty(&ty) } else { false };
-
-        if is_binding_pat(&local.pat) || is_borrow {
-            record_rvalue_scope(visitor, &expr, blk_scope);
+        if let Some(pat) = pat {
+            if is_binding_pat(pat) {
+                record_rvalue_scope(visitor, &expr, blk_scope);
+            }
         }
     }
 
-    intravisit::walk_local(visitor, local);
+    // Make sure we visit the initializer first, so expr_and_pat_count remains correct
+    if let Some(expr) = init {
+        visitor.visit_expr(expr);
+    }
+    if let Some(pat) = pat {
+        visitor.visit_pat(pat);
+    }
 
-    /// True if `pat` match the `P&` nonterminal:
+    /// Returns `true` if `pat` match the `P&` non-terminal.
     ///
     ///     P& = ref X
     ///        | StructName { ..., P&, ... }
@@ -945,11 +1175,35 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     ///        | ( ..., P&, ... )
     ///        | box P&
     fn is_binding_pat(pat: &hir::Pat) -> bool {
-        match pat.node {
-            PatKind::Binding(hir::BindByRef(_), ..) => true,
+        // Note that the code below looks for *explicit* refs only, that is, it won't
+        // know about *implicit* refs as introduced in #42640.
+        //
+        // This is not a problem. For example, consider
+        //
+        //      let (ref x, ref y) = (Foo { .. }, Bar { .. });
+        //
+        // Due to the explicit refs on the left hand side, the below code would signal
+        // that the temporary value on the right hand side should live until the end of
+        // the enclosing block (as opposed to being dropped after the let is complete).
+        //
+        // To create an implicit ref, however, you must have a borrowed value on the RHS
+        // already, as in this example (which won't compile before #42640):
+        //
+        //      let Foo { x, .. } = &Foo { x: ..., ... };
+        //
+        // in place of
+        //
+        //      let Foo { ref x, .. } = Foo { ... };
+        //
+        // In the former case (the implicit ref version), the temporary is created by the
+        // & expression, and its lifetime would be extended to the end of the block (due
+        // to a different rule, not the below code).
+        match pat.kind {
+            PatKind::Binding(hir::BindingAnnotation::Ref, ..) |
+            PatKind::Binding(hir::BindingAnnotation::RefMut, ..) => true,
 
             PatKind::Struct(_, ref field_pats, _) => {
-                field_pats.iter().any(|fp| is_binding_pat(&fp.node.pat))
+                field_pats.iter().any(|fp| is_binding_pat(&fp.pat))
             }
 
             PatKind::Slice(ref pats1, ref pats2, ref pats3) => {
@@ -971,14 +1225,6 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
         }
     }
 
-    /// True if `ty` is a borrowed pointer type like `&int` or `&[...]`.
-    fn is_borrowed_ty(ty: &hir::Ty) -> bool {
-        match ty.node {
-            hir::TyRptr(..) => true,
-            _ => false
-        }
-    }
-
     /// If `expr` matches the `E&` grammar, then records an extended rvalue scope as appropriate:
     ///
     ///     E& = & ET
@@ -989,31 +1235,33 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     ///        | box E&
     ///        | E& as ...
     ///        | ( E& )
-    fn record_rvalue_scope_if_borrow_expr(visitor: &mut RegionResolutionVisitor,
-                                          expr: &hir::Expr,
-                                          blk_id: CodeExtent) {
-        match expr.node {
-            hir::ExprAddrOf(_, ref subexpr) => {
+    fn record_rvalue_scope_if_borrow_expr<'tcx>(
+        visitor: &mut RegionResolutionVisitor<'tcx>,
+        expr: &hir::Expr,
+        blk_id: Option<Scope>,
+    ) {
+        match expr.kind {
+            hir::ExprKind::AddrOf(_, ref subexpr) => {
                 record_rvalue_scope_if_borrow_expr(visitor, &subexpr, blk_id);
                 record_rvalue_scope(visitor, &subexpr, blk_id);
             }
-            hir::ExprStruct(_, ref fields, _) => {
+            hir::ExprKind::Struct(_, ref fields, _) => {
                 for field in fields {
                     record_rvalue_scope_if_borrow_expr(
                         visitor, &field.expr, blk_id);
                 }
             }
-            hir::ExprArray(ref subexprs) |
-            hir::ExprTup(ref subexprs) => {
+            hir::ExprKind::Array(ref subexprs) |
+            hir::ExprKind::Tup(ref subexprs) => {
                 for subexpr in subexprs {
                     record_rvalue_scope_if_borrow_expr(
                         visitor, &subexpr, blk_id);
                 }
             }
-            hir::ExprCast(ref subexpr, _) => {
+            hir::ExprKind::Cast(ref subexpr, _) => {
                 record_rvalue_scope_if_borrow_expr(visitor, &subexpr, blk_id)
             }
-            hir::ExprBlock(ref block) => {
+            hir::ExprKind::Block(ref block, _) => {
                 if let Some(ref subexpr) = block.expr {
                     record_rvalue_scope_if_borrow_expr(
                         visitor, &subexpr, blk_id);
@@ -1037,25 +1285,26 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     ///        | (ET)
     ///        | <rvalue>
     ///
-    /// Note: ET is intended to match "rvalues or lvalues based on rvalues".
-    fn record_rvalue_scope<'a>(visitor: &mut RegionResolutionVisitor,
-                               expr: &'a hir::Expr,
-                               blk_scope: CodeExtent) {
+    /// Note: ET is intended to match "rvalues or places based on rvalues".
+    fn record_rvalue_scope<'tcx>(
+        visitor: &mut RegionResolutionVisitor<'tcx>,
+        expr: &hir::Expr,
+        blk_scope: Option<Scope>,
+    ) {
         let mut expr = expr;
         loop {
             // Note: give all the expressions matching `ET` with the
             // extended temporary lifetime, not just the innermost rvalue,
-            // because in trans if we must compile e.g. `*rvalue()`
+            // because in codegen if we must compile e.g., `*rvalue()`
             // into a temporary, we request the temporary scope of the
             // outer expression.
-            visitor.region_maps.record_rvalue_scope(expr.id, blk_scope);
+            visitor.scope_tree.record_rvalue_scope(expr.hir_id.local_id, blk_scope);
 
-            match expr.node {
-                hir::ExprAddrOf(_, ref subexpr) |
-                hir::ExprUnary(hir::UnDeref, ref subexpr) |
-                hir::ExprField(ref subexpr, _) |
-                hir::ExprTupField(ref subexpr, _) |
-                hir::ExprIndex(ref subexpr, _) => {
+            match expr.kind {
+                hir::ExprKind::AddrOf(_, ref subexpr) |
+                hir::ExprKind::Unary(hir::UnDeref, ref subexpr) |
+                hir::ExprKind::Field(ref subexpr, _) |
+                hir::ExprKind::Index(ref subexpr, _) => {
                     expr = &subexpr;
                 }
                 _ => {
@@ -1066,186 +1315,208 @@ fn resolve_local<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
     }
 }
 
-fn resolve_item_like<'a, 'tcx, F>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
-                                  id: ast::NodeId,
-                                  walk: F)
-    where F: FnOnce(&mut RegionResolutionVisitor<'tcx, 'a>)
-{
-    // Items create a new outer block scope as far as we're concerned.
-    let prev_cx = visitor.cx;
-    let prev_ts = mem::replace(&mut visitor.terminating_scopes, NodeSet());
-    visitor.cx = Context {
-        root_id: None,
-        var_parent: ROOT_CODE_EXTENT,
-        parent: ROOT_CODE_EXTENT
-    };
-    walk(visitor);
-    visitor.create_item_scope_if_needed(id);
-    visitor.cx = prev_cx;
-    visitor.terminating_scopes = prev_ts;
-}
-
-fn resolve_fn<'a, 'tcx>(visitor: &mut RegionResolutionVisitor<'tcx, 'a>,
-                        kind: FnKind<'tcx>,
-                        decl: &'tcx hir::FnDecl,
-                        body_id: hir::BodyId,
-                        sp: Span,
-                        id: ast::NodeId) {
-    debug!("region::resolve_fn(id={:?}, \
-                               span={:?}, \
-                               body.id={:?}, \
-                               cx.parent={:?})",
-           id,
-           visitor.sess.codemap().span_to_string(sp),
-           body_id,
-           visitor.cx.parent);
-
-    visitor.cx.parent = visitor.new_code_extent(
-        CodeExtentData::CallSiteScope { fn_id: id, body_id: body_id.node_id });
-
-    let fn_decl_scope = visitor.new_code_extent(
-        CodeExtentData::ParameterScope { fn_id: id, body_id: body_id.node_id });
-
-    if let Some(root_id) = visitor.cx.root_id {
-        visitor.region_maps.record_fn_parent(body_id.node_id, root_id);
-    }
-
-    let outer_cx = visitor.cx;
-    let outer_ts = mem::replace(&mut visitor.terminating_scopes, NodeSet());
-    visitor.terminating_scopes.insert(body_id.node_id);
-
-    // The arguments and `self` are parented to the fn.
-    visitor.cx = Context {
-        root_id: Some(body_id.node_id),
-        parent: ROOT_CODE_EXTENT,
-        var_parent: fn_decl_scope,
-    };
-
-    intravisit::walk_fn_decl(visitor, decl);
-    intravisit::walk_fn_kind(visitor, kind);
-
-    // The body of the every fn is a root scope.
-    visitor.cx = Context {
-        root_id: Some(body_id.node_id),
-        parent: fn_decl_scope,
-        var_parent: fn_decl_scope
-    };
-    visitor.visit_nested_body(body_id);
-
-    // Restore context we had at the start.
-    visitor.cx = outer_cx;
-    visitor.terminating_scopes = outer_ts;
-}
-
-impl<'ast, 'a> RegionResolutionVisitor<'ast, 'a> {
+impl<'tcx> RegionResolutionVisitor<'tcx> {
     /// Records the current parent (if any) as the parent of `child_scope`.
-    fn new_code_extent(&mut self, child_scope: CodeExtentData) -> CodeExtent {
-        self.region_maps.intern_code_extent(child_scope, self.cx.parent)
+    /// Returns the depth of `child_scope`.
+    fn record_child_scope(&mut self, child_scope: Scope) -> ScopeDepth {
+        let parent = self.cx.parent;
+        self.scope_tree.record_scope_parent(child_scope, parent);
+        // If `child_scope` has no parent, it must be the root node, and so has
+        // a depth of 1. Otherwise, its depth is one more than its parent's.
+        parent.map_or(1, |(_p, d)| d + 1)
     }
 
-    fn new_node_extent(&mut self, child_scope: ast::NodeId) -> CodeExtent {
-        self.new_code_extent(CodeExtentData::Misc(child_scope))
+    /// Records the current parent (if any) as the parent of `child_scope`,
+    /// and sets `child_scope` as the new current parent.
+    fn enter_scope(&mut self, child_scope: Scope) {
+        let child_depth = self.record_child_scope(child_scope);
+        self.cx.parent = Some((child_scope, child_depth));
     }
 
-    fn new_node_extent_with_dtor(&mut self, id: ast::NodeId) -> CodeExtent {
+    fn enter_node_scope_with_dtor(&mut self, id: hir::ItemLocalId) {
         // If node was previously marked as a terminating scope during the
         // recursive visit of its parent node in the AST, then we need to
-        // account for the destruction scope representing the extent of
+        // account for the destruction scope representing the scope of
         // the destructors that run immediately after it completes.
         if self.terminating_scopes.contains(&id) {
-            let ds = self.new_code_extent(
-                CodeExtentData::DestructionScope(id));
-            self.region_maps.intern_node(id, ds)
-        } else {
-            self.new_node_extent(id)
+            self.enter_scope(Scope { id, data: ScopeData::Destruction });
         }
-    }
-
-    fn create_item_scope_if_needed(&mut self, id: ast::NodeId) {
-        // create a region for the destruction scope - this is needed
-        // for constructing parameter environments based on the item.
-        // functions put their destruction scopes *inside* their parameter
-        // scopes.
-        let scope = CodeExtentData::DestructionScope(id);
-        if !self.region_maps.code_extent_interner.borrow().contains_key(&scope) {
-            self.region_maps.intern_code_extent(scope, ROOT_CODE_EXTENT);
-        }
+        self.enter_scope(Scope { id, data: ScopeData::Node });
     }
 }
 
-impl<'ast, 'a> Visitor<'ast> for RegionResolutionVisitor<'ast, 'a> {
-    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'ast> {
-        NestedVisitorMap::OnlyBodies(&self.map)
+impl<'tcx> Visitor<'tcx> for RegionResolutionVisitor<'tcx> {
+    fn nested_visit_map<'this>(&'this mut self) -> NestedVisitorMap<'this, 'tcx> {
+        NestedVisitorMap::None
     }
 
-    fn visit_block(&mut self, b: &'ast Block) {
+    fn visit_block(&mut self, b: &'tcx Block) {
         resolve_block(self, b);
     }
 
-    fn visit_item(&mut self, i: &'ast Item) {
-        resolve_item_like(self, i.id, |this| intravisit::walk_item(this, i));
+    fn visit_body(&mut self, body: &'tcx hir::Body) {
+        let body_id = body.id();
+        let owner_id = self.tcx.hir().body_owner(body_id);
+
+        debug!("visit_body(id={:?}, span={:?}, body.id={:?}, cx.parent={:?})",
+               owner_id,
+               self.tcx.sess.source_map().span_to_string(body.value.span),
+               body_id,
+               self.cx.parent);
+
+        let outer_ec = mem::replace(&mut self.expr_and_pat_count, 0);
+        let outer_cx = self.cx;
+        let outer_ts = mem::take(&mut self.terminating_scopes);
+        self.terminating_scopes.insert(body.value.hir_id.local_id);
+
+        if let Some(root_id) = self.cx.root_id {
+            self.scope_tree.record_closure_parent(body.value.hir_id.local_id, root_id);
+        }
+        self.cx.root_id = Some(body.value.hir_id.local_id);
+
+        self.enter_scope(Scope { id: body.value.hir_id.local_id, data: ScopeData::CallSite });
+        self.enter_scope(Scope { id: body.value.hir_id.local_id, data: ScopeData::Arguments });
+
+        // The arguments and `self` are parented to the fn.
+        self.cx.var_parent = self.cx.parent.take();
+        for param in &body.params {
+            self.visit_pat(&param.pat);
+        }
+
+        // The body of the every fn is a root scope.
+        self.cx.parent = self.cx.var_parent;
+        if self.tcx.hir().body_owner_kind(owner_id).is_fn_or_closure() {
+            self.visit_expr(&body.value)
+        } else {
+            // Only functions have an outer terminating (drop) scope, while
+            // temporaries in constant initializers may be 'static, but only
+            // according to rvalue lifetime semantics, using the same
+            // syntactical rules used for let initializers.
+            //
+            // e.g., in `let x = &f();`, the temporary holding the result from
+            // the `f()` call lives for the entirety of the surrounding block.
+            //
+            // Similarly, `const X: ... = &f();` would have the result of `f()`
+            // live for `'static`, implying (if Drop restrictions on constants
+            // ever get lifted) that the value *could* have a destructor, but
+            // it'd get leaked instead of the destructor running during the
+            // evaluation of `X` (if at all allowed by CTFE).
+            //
+            // However, `const Y: ... = g(&f());`, like `let y = g(&f());`,
+            // would *not* let the `f()` temporary escape into an outer scope
+            // (i.e., `'static`), which means that after `g` returns, it drops,
+            // and all the associated destruction scope rules apply.
+            self.cx.var_parent = None;
+            resolve_local(self, None, Some(&body.value));
+        }
+
+        if body.generator_kind.is_some() {
+            self.scope_tree.body_expr_count.insert(body_id, self.expr_and_pat_count);
+        }
+
+        // Restore context we had at the start.
+        self.expr_and_pat_count = outer_ec;
+        self.cx = outer_cx;
+        self.terminating_scopes = outer_ts;
     }
 
-    fn visit_impl_item(&mut self, ii: &'ast hir::ImplItem) {
-        resolve_item_like(self, ii.id, |this| intravisit::walk_impl_item(this, ii));
-    }
-
-    fn visit_trait_item(&mut self, ti: &'ast hir::TraitItem) {
-        resolve_item_like(self, ti.id, |this| intravisit::walk_trait_item(this, ti));
-    }
-
-    fn visit_fn(&mut self, fk: FnKind<'ast>, fd: &'ast FnDecl,
-                b: hir::BodyId, s: Span, n: NodeId) {
-        resolve_fn(self, fk, fd, b, s, n);
-    }
-    fn visit_arm(&mut self, a: &'ast Arm) {
+    fn visit_arm(&mut self, a: &'tcx Arm) {
         resolve_arm(self, a);
     }
-    fn visit_pat(&mut self, p: &'ast Pat) {
+    fn visit_pat(&mut self, p: &'tcx Pat) {
         resolve_pat(self, p);
     }
-    fn visit_stmt(&mut self, s: &'ast Stmt) {
+    fn visit_stmt(&mut self, s: &'tcx Stmt) {
         resolve_stmt(self, s);
     }
-    fn visit_expr(&mut self, ex: &'ast Expr) {
+    fn visit_expr(&mut self, ex: &'tcx Expr) {
         resolve_expr(self, ex);
     }
-    fn visit_local(&mut self, l: &'ast Local) {
-        resolve_local(self, l);
+    fn visit_local(&mut self, l: &'tcx Local) {
+        resolve_local(self, Some(&l.pat), l.init.as_ref().map(|e| &**e));
     }
 }
 
-pub fn resolve_crate(sess: &Session, map: &ast_map::Map) -> RegionMaps {
-    let _task = map.dep_graph.in_task(DepNode::RegionResolveCrate);
-    let krate = map.krate();
+fn region_scope_tree(tcx: TyCtxt<'_>, def_id: DefId) -> &ScopeTree {
+    let closure_base_def_id = tcx.closure_base_def_id(def_id);
+    if closure_base_def_id != def_id {
+        return tcx.region_scope_tree(closure_base_def_id);
+    }
 
-    let maps = RegionMaps {
-        code_extents: RefCell::new(vec![]),
-        code_extent_interner: RefCell::new(FxHashMap()),
-        scope_map: RefCell::new(vec![]),
-        var_map: RefCell::new(NodeMap()),
-        rvalue_scopes: RefCell::new(NodeMap()),
-        fn_tree: RefCell::new(NodeMap()),
-    };
-    let root_extent = maps.bogus_code_extent(
-        CodeExtentData::DestructionScope(ast::DUMMY_NODE_ID));
-    assert_eq!(root_extent, ROOT_CODE_EXTENT);
-    let bogus_extent = maps.bogus_code_extent(
-        CodeExtentData::Misc(ast::DUMMY_NODE_ID));
-    assert_eq!(bogus_extent, DUMMY_CODE_EXTENT);
-    {
+    let id = tcx.hir().as_local_hir_id(def_id).unwrap();
+    let scope_tree = if let Some(body_id) = tcx.hir().maybe_body_owned_by(id) {
         let mut visitor = RegionResolutionVisitor {
-            sess: sess,
-            region_maps: &maps,
-            map: map,
+            tcx,
+            scope_tree: ScopeTree::default(),
+            expr_and_pat_count: 0,
             cx: Context {
                 root_id: None,
-                parent: ROOT_CODE_EXTENT,
-                var_parent: ROOT_CODE_EXTENT
+                parent: None,
+                var_parent: None,
             },
-            terminating_scopes: NodeSet()
+            terminating_scopes: Default::default(),
+            pessimistic_yield: false,
+            fixup_scopes: vec![],
         };
-        krate.visit_all_item_likes(&mut visitor.as_deep_visitor());
+
+        let body = tcx.hir().body(body_id);
+        visitor.scope_tree.root_body = Some(body.value.hir_id);
+
+        // If the item is an associated const or a method,
+        // record its impl/trait parent, as it can also have
+        // lifetime parameters free in this body.
+        match tcx.hir().get(id) {
+            Node::ImplItem(_) |
+            Node::TraitItem(_) => {
+                visitor.scope_tree.root_parent = Some(tcx.hir().get_parent_item(id));
+            }
+            _ => {}
+        }
+
+        visitor.visit_body(body);
+
+        visitor.scope_tree
+    } else {
+        ScopeTree::default()
+    };
+
+    tcx.arena.alloc(scope_tree)
+}
+
+pub fn provide(providers: &mut Providers<'_>) {
+    *providers = Providers {
+        region_scope_tree,
+        ..*providers
+    };
+}
+
+impl<'a> HashStable<StableHashingContext<'a>> for ScopeTree {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let ScopeTree {
+            root_body,
+            root_parent,
+            ref body_expr_count,
+            ref parent_map,
+            ref var_map,
+            ref destruction_scopes,
+            ref rvalue_scopes,
+            ref closure_tree,
+            ref yield_in_scope,
+        } = *self;
+
+        hcx.with_node_id_hashing_mode(NodeIdHashingMode::HashDefPath, |hcx| {
+            root_body.hash_stable(hcx, hasher);
+            root_parent.hash_stable(hcx, hasher);
+        });
+
+        body_expr_count.hash_stable(hcx, hasher);
+        parent_map.hash_stable(hcx, hasher);
+        var_map.hash_stable(hcx, hasher);
+        destruction_scopes.hash_stable(hcx, hasher);
+        rvalue_scopes.hash_stable(hcx, hasher);
+        closure_tree.hash_stable(hcx, hasher);
+        yield_in_scope.hash_stable(hcx, hasher);
     }
-    return maps;
 }

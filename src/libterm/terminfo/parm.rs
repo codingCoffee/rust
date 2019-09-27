@@ -1,21 +1,12 @@
-// Copyright 2012 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Parameterized string expansion
 
 use self::Param::*;
 use self::States::*;
-use self::FormatState::*;
-use self::FormatOp::*;
 
 use std::iter::repeat;
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Clone, Copy, PartialEq)]
 enum States {
@@ -36,9 +27,9 @@ enum States {
 
 #[derive(Copy, PartialEq, Clone)]
 enum FormatState {
-    FormatStateFlags,
-    FormatStateWidth,
-    FormatStatePrecision,
+    Flags,
+    Width,
+    Precision,
 }
 
 /// Types of parameters a capability can use
@@ -52,23 +43,27 @@ pub enum Param {
 /// Container for static and dynamic variable arrays
 pub struct Variables {
     /// Static variables A-Z
-    sta: [Param; 26],
+    sta_va: [Param; 26],
     /// Dynamic variables a-z
-    dyn: [Param; 26],
+    dyn_va: [Param; 26],
 }
 
 impl Variables {
-    /// Return a new zero-initialized Variables
+    /// Returns a new zero-initialized Variables
     pub fn new() -> Variables {
         Variables {
-            sta: [Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0)],
-            dyn: [Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
-                  Number(0), Number(0), Number(0), Number(0), Number(0)],
+            sta_va: [
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0)
+            ],
+            dyn_va: [
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0), Number(0), Number(0),
+                Number(0), Number(0), Number(0), Number(0), Number(0)
+            ],
         }
     }
 }
@@ -210,22 +205,22 @@ pub fn expand(cap: &[u8], params: &[Param], vars: &mut Variables) -> Result<Vec<
                         if let Some(arg) = stack.pop() {
                             let flags = Flags::new();
                             let res = format(arg, FormatOp::from_char(cur), flags)?;
-                            output.extend(res.iter().map(|x| *x));
+                            output.extend(res.iter().cloned());
                         } else {
                             return Err("stack is empty".to_string());
                         }
                     }
-                    ':' | '#' | ' ' | '.' | '0'...'9' => {
+                    ':' | '#' | ' ' | '.' | '0'..='9' => {
                         let mut flags = Flags::new();
-                        let mut fstate = FormatStateFlags;
+                        let mut fstate = FormatState::Flags;
                         match cur {
                             ':' => (),
                             '#' => flags.alternate = true,
                             ' ' => flags.space = true,
-                            '.' => fstate = FormatStatePrecision,
-                            '0'...'9' => {
+                            '.' => fstate = FormatState::Precision,
+                            '0'..='9' => {
                                 flags.width = cur as usize - '0' as usize;
-                                fstate = FormatStateWidth;
+                                fstate = FormatState::Width;
                             }
                             _ => unreachable!(),
                         }
@@ -261,14 +256,14 @@ pub fn expand(cap: &[u8], params: &[Param], vars: &mut Variables) -> Result<Vec<
                 if cur >= 'A' && cur <= 'Z' {
                     if let Some(arg) = stack.pop() {
                         let idx = (cur as u8) - b'A';
-                        vars.sta[idx as usize] = arg;
+                        vars.sta_va[idx as usize] = arg;
                     } else {
                         return Err("stack is empty".to_string());
                     }
                 } else if cur >= 'a' && cur <= 'z' {
                     if let Some(arg) = stack.pop() {
                         let idx = (cur as u8) - b'a';
-                        vars.dyn[idx as usize] = arg;
+                        vars.dyn_va[idx as usize] = arg;
                     } else {
                         return Err("stack is empty".to_string());
                     }
@@ -279,10 +274,10 @@ pub fn expand(cap: &[u8], params: &[Param], vars: &mut Variables) -> Result<Vec<
             GetVar => {
                 if cur >= 'A' && cur <= 'Z' {
                     let idx = (cur as u8) - b'A';
-                    stack.push(vars.sta[idx as usize].clone());
+                    stack.push(vars.sta_va[idx as usize].clone());
                 } else if cur >= 'a' && cur <= 'z' {
                     let idx = (cur as u8) - b'a';
-                    stack.push(vars.dyn[idx as usize].clone());
+                    stack.push(vars.dyn_va[idx as usize].clone());
                 } else {
                     return Err("bad variable name in %g".to_string());
                 }
@@ -318,43 +313,43 @@ pub fn expand(cap: &[u8], params: &[Param], vars: &mut Variables) -> Result<Vec<
                     (_, 'd') | (_, 'o') | (_, 'x') | (_, 'X') | (_, 's') => {
                         if let Some(arg) = stack.pop() {
                             let res = format(arg, FormatOp::from_char(cur), *flags)?;
-                            output.extend(res.iter().map(|x| *x));
+                            output.extend(res.iter().cloned());
                             // will cause state to go to Nothing
                             old_state = FormatPattern(*flags, *fstate);
                         } else {
                             return Err("stack is empty".to_string());
                         }
                     }
-                    (FormatStateFlags, '#') => {
+                    (FormatState::Flags, '#') => {
                         flags.alternate = true;
                     }
-                    (FormatStateFlags, '-') => {
+                    (FormatState::Flags, '-') => {
                         flags.left = true;
                     }
-                    (FormatStateFlags, '+') => {
+                    (FormatState::Flags, '+') => {
                         flags.sign = true;
                     }
-                    (FormatStateFlags, ' ') => {
+                    (FormatState::Flags, ' ') => {
                         flags.space = true;
                     }
-                    (FormatStateFlags, '0'...'9') => {
+                    (FormatState::Flags, '0'..='9') => {
                         flags.width = cur as usize - '0' as usize;
-                        *fstate = FormatStateWidth;
+                        *fstate = FormatState::Width;
                     }
-                    (FormatStateFlags, '.') => {
-                        *fstate = FormatStatePrecision;
+                    (FormatState::Flags, '.') => {
+                        *fstate = FormatState::Precision;
                     }
-                    (FormatStateWidth, '0'...'9') => {
+                    (FormatState::Width, '0'..='9') => {
                         let old = flags.width;
                         flags.width = flags.width * 10 + (cur as usize - '0' as usize);
                         if flags.width < old {
                             return Err("format width overflow".to_string());
                         }
                     }
-                    (FormatStateWidth, '.') => {
-                        *fstate = FormatStatePrecision;
+                    (FormatState::Width, '.') => {
+                        *fstate = FormatState::Precision;
                     }
-                    (FormatStatePrecision, '0'...'9') => {
+                    (FormatState::Precision, '0'..='9') => {
                         let old = flags.precision;
                         flags.precision = flags.precision * 10 + (cur as usize - '0' as usize);
                         if flags.precision < old {
@@ -437,31 +432,31 @@ impl Flags {
 
 #[derive(Copy, Clone)]
 enum FormatOp {
-    FormatDigit,
-    FormatOctal,
-    FormatHex,
-    FormatHEX,
-    FormatString,
+    Digit,
+    Octal,
+    LowerHex,
+    UpperHex,
+    String,
 }
 
 impl FormatOp {
     fn from_char(c: char) -> FormatOp {
         match c {
-            'd' => FormatDigit,
-            'o' => FormatOctal,
-            'x' => FormatHex,
-            'X' => FormatHEX,
-            's' => FormatString,
+            'd' => FormatOp::Digit,
+            'o' => FormatOp::Octal,
+            'x' => FormatOp::LowerHex,
+            'X' => FormatOp::UpperHex,
+            's' => FormatOp::String,
             _ => panic!("bad FormatOp char"),
         }
     }
     fn to_char(self) -> char {
         match self {
-            FormatDigit => 'd',
-            FormatOctal => 'o',
-            FormatHex => 'x',
-            FormatHEX => 'X',
-            FormatString => 's',
+            FormatOp::Digit => 'd',
+            FormatOp::Octal => 'o',
+            FormatOp::LowerHex => 'x',
+            FormatOp::UpperHex => 'X',
+            FormatOp::String => 's',
         }
     }
 }
@@ -470,7 +465,7 @@ fn format(val: Param, op: FormatOp, flags: Flags) -> Result<Vec<u8>, String> {
     let mut s = match val {
         Number(d) => {
             match op {
-                FormatDigit => {
+                FormatOp::Digit => {
                     if flags.sign {
                         format!("{:+01$}", d, flags.precision)
                     } else if d < 0 {
@@ -482,7 +477,7 @@ fn format(val: Param, op: FormatOp, flags: Flags) -> Result<Vec<u8>, String> {
                         format!("{:01$}", d, flags.precision)
                     }
                 }
-                FormatOctal => {
+                FormatOp::Octal => {
                     if flags.alternate {
                         // Leading octal zero counts against precision.
                         format!("0{:01$o}", d, flags.precision.saturating_sub(1))
@@ -490,27 +485,27 @@ fn format(val: Param, op: FormatOp, flags: Flags) -> Result<Vec<u8>, String> {
                         format!("{:01$o}", d, flags.precision)
                     }
                 }
-                FormatHex => {
+                FormatOp::LowerHex => {
                     if flags.alternate && d != 0 {
                         format!("0x{:01$x}", d, flags.precision)
                     } else {
                         format!("{:01$x}", d, flags.precision)
                     }
                 }
-                FormatHEX => {
+                FormatOp::UpperHex => {
                     if flags.alternate && d != 0 {
                         format!("0X{:01$X}", d, flags.precision)
                     } else {
                         format!("{:01$X}", d, flags.precision)
                     }
                 }
-                FormatString => return Err("non-number on stack with %s".to_string()),
+                FormatOp::String => return Err("non-number on stack with %s".to_string()),
             }
             .into_bytes()
         }
         Words(s) => {
             match op {
-                FormatString => {
+                FormatOp::String => {
                     let mut s = s.into_bytes();
                     if flags.precision > 0 && flags.precision < s.len() {
                         s.truncate(flags.precision);
@@ -533,145 +528,4 @@ fn format(val: Param, op: FormatOp, flags: Flags) -> Result<Vec<u8>, String> {
         }
     }
     Ok(s)
-}
-
-#[cfg(test)]
-mod test {
-    use super::{expand, Variables};
-    use super::Param::{self, Words, Number};
-    use std::result::Result::Ok;
-
-    #[test]
-    fn test_basic_setabf() {
-        let s = b"\\E[48;5;%p1%dm";
-        assert_eq!(expand(s, &[Number(1)], &mut Variables::new()).unwrap(),
-                   "\\E[48;5;1m".bytes().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_multiple_int_constants() {
-        assert_eq!(expand(b"%{1}%{2}%d%d", &[], &mut Variables::new()).unwrap(),
-                   "21".bytes().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_op_i() {
-        let mut vars = Variables::new();
-        assert_eq!(expand(b"%p1%d%p2%d%p3%d%i%p1%d%p2%d%p3%d",
-                          &[Number(1), Number(2), Number(3)],
-                          &mut vars),
-                   Ok("123233".bytes().collect::<Vec<_>>()));
-        assert_eq!(expand(b"%p1%d%p2%d%i%p1%d%p2%d", &[], &mut vars),
-                   Ok("0011".bytes().collect::<Vec<_>>()));
-    }
-
-    #[test]
-    fn test_param_stack_failure_conditions() {
-        let mut varstruct = Variables::new();
-        let vars = &mut varstruct;
-        fn get_res(fmt: &str,
-                   cap: &str,
-                   params: &[Param],
-                   vars: &mut Variables)
-                   -> Result<Vec<u8>, String> {
-            let mut u8v: Vec<_> = fmt.bytes().collect();
-            u8v.extend(cap.as_bytes().iter().map(|&b| b));
-            expand(&u8v, params, vars)
-        }
-
-        let caps = ["%d", "%c", "%s", "%Pa", "%l", "%!", "%~"];
-        for &cap in caps.iter() {
-            let res = get_res("", cap, &[], vars);
-            assert!(res.is_err(),
-                    "Op {} succeeded incorrectly with 0 stack entries",
-                    cap);
-            let p = if cap == "%s" || cap == "%l" {
-                Words("foo".to_string())
-            } else {
-                Number(97)
-            };
-            let res = get_res("%p1", cap, &[p], vars);
-            assert!(res.is_ok(),
-                    "Op {} failed with 1 stack entry: {}",
-                    cap,
-                    res.unwrap_err());
-        }
-        let caps = ["%+", "%-", "%*", "%/", "%m", "%&", "%|", "%A", "%O"];
-        for &cap in caps.iter() {
-            let res = expand(cap.as_bytes(), &[], vars);
-            assert!(res.is_err(),
-                    "Binop {} succeeded incorrectly with 0 stack entries",
-                    cap);
-            let res = get_res("%{1}", cap, &[], vars);
-            assert!(res.is_err(),
-                    "Binop {} succeeded incorrectly with 1 stack entry",
-                    cap);
-            let res = get_res("%{1}%{2}", cap, &[], vars);
-            assert!(res.is_ok(),
-                    "Binop {} failed with 2 stack entries: {}",
-                    cap,
-                    res.unwrap_err());
-        }
-    }
-
-    #[test]
-    fn test_push_bad_param() {
-        assert!(expand(b"%pa", &[], &mut Variables::new()).is_err());
-    }
-
-    #[test]
-    fn test_comparison_ops() {
-        let v = [('<', [1u8, 0u8, 0u8]), ('=', [0u8, 1u8, 0u8]), ('>', [0u8, 0u8, 1u8])];
-        for &(op, bs) in v.iter() {
-            let s = format!("%{{1}}%{{2}}%{}%d", op);
-            let res = expand(s.as_bytes(), &[], &mut Variables::new());
-            assert!(res.is_ok(), res.unwrap_err());
-            assert_eq!(res.unwrap(), vec![b'0' + bs[0]]);
-            let s = format!("%{{1}}%{{1}}%{}%d", op);
-            let res = expand(s.as_bytes(), &[], &mut Variables::new());
-            assert!(res.is_ok(), res.unwrap_err());
-            assert_eq!(res.unwrap(), vec![b'0' + bs[1]]);
-            let s = format!("%{{2}}%{{1}}%{}%d", op);
-            let res = expand(s.as_bytes(), &[], &mut Variables::new());
-            assert!(res.is_ok(), res.unwrap_err());
-            assert_eq!(res.unwrap(), vec![b'0' + bs[2]]);
-        }
-    }
-
-    #[test]
-    fn test_conditionals() {
-        let mut vars = Variables::new();
-        let s = b"\\E[%?%p1%{8}%<%t3%p1%d%e%p1%{16}%<%t9%p1%{8}%-%d%e38;5;%p1%d%;m";
-        let res = expand(s, &[Number(1)], &mut vars);
-        assert!(res.is_ok(), res.unwrap_err());
-        assert_eq!(res.unwrap(), "\\E[31m".bytes().collect::<Vec<_>>());
-        let res = expand(s, &[Number(8)], &mut vars);
-        assert!(res.is_ok(), res.unwrap_err());
-        assert_eq!(res.unwrap(), "\\E[90m".bytes().collect::<Vec<_>>());
-        let res = expand(s, &[Number(42)], &mut vars);
-        assert!(res.is_ok(), res.unwrap_err());
-        assert_eq!(res.unwrap(), "\\E[38;5;42m".bytes().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn test_format() {
-        let mut varstruct = Variables::new();
-        let vars = &mut varstruct;
-        assert_eq!(expand(b"%p1%s%p2%2s%p3%2s%p4%.2s",
-                          &[Words("foo".to_string()),
-                            Words("foo".to_string()),
-                            Words("f".to_string()),
-                            Words("foo".to_string())],
-                          vars),
-                   Ok("foofoo ffo".bytes().collect::<Vec<_>>()));
-        assert_eq!(expand(b"%p1%:-4.2s", &[Words("foo".to_string())], vars),
-                   Ok("fo  ".bytes().collect::<Vec<_>>()));
-
-        assert_eq!(expand(b"%p1%d%p1%.3d%p1%5d%p1%:+d", &[Number(1)], vars),
-                   Ok("1001    1+1".bytes().collect::<Vec<_>>()));
-        assert_eq!(expand(b"%p1%o%p1%#o%p2%6.4x%p2%#6.4X",
-                          &[Number(15), Number(27)],
-                          vars),
-                   Ok("17017  001b0X001B".bytes().collect::<Vec<_>>()));
-    }
 }

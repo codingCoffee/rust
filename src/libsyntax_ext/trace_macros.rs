@@ -1,42 +1,28 @@
-// Copyright 2012 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-use syntax::ext::base::ExtCtxt;
-use syntax::ext::base;
-use syntax::feature_gate;
-use syntax::symbol::keywords;
+use syntax::ext::base::{self, ExtCtxt};
+use syntax::symbol::kw;
 use syntax_pos::Span;
-use syntax::tokenstream::TokenTree;
+use syntax::tokenstream::{TokenTree, TokenStream};
 
-pub fn expand_trace_macros(cx: &mut ExtCtxt,
+pub fn expand_trace_macros(cx: &mut ExtCtxt<'_>,
                            sp: Span,
-                           tt: &[TokenTree])
-                           -> Box<base::MacResult + 'static> {
-    if !cx.ecfg.enable_trace_macros() {
-        feature_gate::emit_feature_err(&cx.parse_sess,
-                                       "trace_macros",
-                                       sp,
-                                       feature_gate::GateIssue::Language,
-                                       feature_gate::EXPLAIN_TRACE_MACROS);
-        return base::DummyResult::any(sp);
+                           tt: TokenStream)
+                           -> Box<dyn base::MacResult + 'static> {
+    let mut cursor = tt.into_trees();
+    let mut err = false;
+    let value = match &cursor.next() {
+        Some(TokenTree::Token(token)) if token.is_keyword(kw::True) => true,
+        Some(TokenTree::Token(token)) if token.is_keyword(kw::False) => false,
+        _ => {
+            err = true;
+            false
+        },
+    };
+    err |= cursor.next().is_some();
+    if err {
+        cx.span_err(sp, "trace_macros! accepts only `true` or `false`")
+    } else {
+        cx.set_trace_macros(value);
     }
 
-    match (tt.len(), tt.first()) {
-        (1, Some(&TokenTree::Token(_, ref tok))) if tok.is_keyword(keywords::True) => {
-            cx.set_trace_macros(true);
-        }
-        (1, Some(&TokenTree::Token(_, ref tok))) if tok.is_keyword(keywords::False) => {
-            cx.set_trace_macros(false);
-        }
-        _ => cx.span_err(sp, "trace_macros! accepts only `true` or `false`"),
-    }
-
-    base::DummyResult::any(sp)
+    base::DummyResult::any_valid(sp)
 }

@@ -1,72 +1,60 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! This pass just dumps MIR at a specified point.
 
+use std::borrow::Cow;
 use std::fmt;
+use std::fs::File;
+use std::io;
 
+use rustc::mir::Body;
+use rustc::session::config::{OutputFilenames, OutputType};
 use rustc::ty::TyCtxt;
-use rustc::mir::*;
-use rustc::mir::transform::{Pass, MirPass, MirPassHook, MirSource};
-use pretty;
+use crate::transform::{MirPass, MirSource};
+use crate::util as mir_util;
 
-pub struct Marker<'a>(pub &'a str);
+pub struct Marker(pub &'static str);
 
-impl<'b, 'tcx> MirPass<'tcx> for Marker<'b> {
-    fn run_pass<'a>(&mut self, _tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                    _src: MirSource, _mir: &mut Mir<'tcx>)
-    {}
+impl<'tcx> MirPass<'tcx> for Marker {
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(self.0)
+    }
+
+    fn run_pass(&self, _tcx: TyCtxt<'tcx>, _source: MirSource<'tcx>, _body: &mut Body<'tcx>) {
+    }
 }
 
-impl<'b> Pass for Marker<'b> {
-    fn name(&self) -> ::std::borrow::Cow<'static, str> { String::from(self.0).into() }
-}
-
-pub struct Disambiguator<'a> {
-    pass: &'a Pass,
+pub struct Disambiguator {
     is_after: bool
 }
 
-impl<'a> fmt::Display for Disambiguator<'a> {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+impl fmt::Display for Disambiguator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let title = if self.is_after { "after" } else { "before" };
-        if let Some(fmt) = self.pass.disambiguator() {
-            write!(formatter, "{}-{}", fmt, title)
-        } else {
-            write!(formatter, "{}", title)
-        }
+        write!(formatter, "{}", title)
     }
 }
 
-pub struct DumpMir;
-
-impl<'tcx> MirPassHook<'tcx> for DumpMir {
-    fn on_mir_pass<'a>(
-        &mut self,
-        tcx: TyCtxt<'a, 'tcx, 'tcx>,
-        src: MirSource,
-        mir: &Mir<'tcx>,
-        pass: &Pass,
-        is_after: bool)
-    {
-        pretty::dump_mir(
-            tcx,
-            &*pass.name(),
-            &Disambiguator {
-                pass: pass,
-                is_after: is_after
-            },
-            src,
-            mir
-        );
+pub fn on_mir_pass<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pass_num: &dyn fmt::Display,
+    pass_name: &str,
+    source: MirSource<'tcx>,
+    body: &Body<'tcx>,
+    is_after: bool,
+) {
+    if mir_util::dump_enabled(tcx, pass_name, source) {
+        mir_util::dump_mir(tcx,
+                           Some(pass_num),
+                           pass_name,
+                           &Disambiguator { is_after },
+                           source,
+                           body,
+                           |_, _| Ok(()) );
     }
 }
 
-impl<'b> Pass for DumpMir {}
+pub fn emit_mir(tcx: TyCtxt<'_>, outputs: &OutputFilenames) -> io::Result<()> {
+    let path = outputs.path(OutputType::Mir);
+    let mut f = File::create(&path)?;
+    mir_util::write_mir_pretty(tcx, None, &mut f)?;
+    Ok(())
+}

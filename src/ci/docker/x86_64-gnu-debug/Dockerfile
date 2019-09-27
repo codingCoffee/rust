@@ -1,4 +1,4 @@
-FROM ubuntu:16.04
+FROM ubuntu:19.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   g++ \
@@ -7,23 +7,38 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   curl \
   ca-certificates \
   python2.7 \
+  python2.7-dev \
+  libxml2-dev \
+  libncurses-dev \
+  libedit-dev \
+  swig \
+  doxygen \
   git \
   cmake \
   sudo \
   gdb \
-  xz-utils
+  libssl-dev \
+  pkg-config \
+  xz-utils \
+  lld \
+  clang
 
-ENV SCCACHE_DIGEST=7237e38e029342fa27b7ac25412cb9d52554008b12389727320bd533fd7f05b6a96d55485f305caf95e5c8f5f97c3313e10012ccad3e752aba2518f3522ba783
-RUN curl -L https://api.pub.build.mozilla.org/tooltool/sha512/$SCCACHE_DIGEST | \
-      tar xJf - -C /usr/local/bin --strip-components=1
+COPY scripts/sccache.sh /scripts/
+RUN sh /scripts/sccache.sh
 
-RUN curl -OL https://github.com/Yelp/dumb-init/releases/download/v1.2.0/dumb-init_1.2.0_amd64.deb && \
-    dpkg -i dumb-init_*.deb && \
-    rm dumb-init_*.deb
-ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+ENV RUSTBUILD_FORCE_CLANG_BASED_TESTS 1
+ENV RUN_CHECK_WITH_PARALLEL_QUERIES 1
 
 ENV RUST_CONFIGURE_ARGS \
       --build=x86_64-unknown-linux-gnu \
       --enable-debug \
-      --enable-optimize
-ENV SCRIPT python2.7 ../x.py build
+      --enable-lld \
+      --enable-optimize \
+      --set llvm.use-linker=lld \
+      --set target.x86_64-unknown-linux-gnu.linker=clang \
+      --set target.x86_64-unknown-linux-gnu.cc=clang \
+      --set target.x86_64-unknown-linux-gnu.cxx=clang++
+
+ENV SCRIPT \
+  python2.7 ../x.py build && \
+  python2.7 ../x.py test src/test/run-make-fulldeps --test-args clang

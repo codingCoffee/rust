@@ -1,14 +1,4 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-//! Implementation of panics backed by libgcc/libunwind (in some form)
+//! Implementation of panics backed by libgcc/libunwind (in some form).
 //!
 //! For background on exception handling and stack unwinding please see
 //! "Exception Handling in LLVM" (llvm.org/docs/ExceptionHandling.html) and
@@ -25,7 +15,7 @@
 //!
 //! In both phases the unwinder walks stack frames from top to bottom using
 //! information from the stack frame unwind sections of the current process's
-//! modules ("module" here refers to an OS module, i.e. an executable or a
+//! modules ("module" here refers to an OS module, i.e., an executable or a
 //! dynamic library).
 //!
 //! For each stack frame, it invokes the associated "personality routine", whose
@@ -33,14 +23,14 @@
 //!
 //! In the search phase, the job of a personality routine is to examine
 //! exception object being thrown, and to decide whether it should be caught at
-//! that stack frame.  Once the handler frame has been identified, cleanup phase
+//! that stack frame. Once the handler frame has been identified, cleanup phase
 //! begins.
 //!
 //! In the cleanup phase, the unwinder invokes each personality routine again.
 //! This time it decides which (if any) cleanup code needs to be run for
-//! the current stack frame.  If so, the control is transferred to a special
+//! the current stack frame. If so, the control is transferred to a special
 //! branch in the function body, the "landing pad", which invokes destructors,
-//! frees memory, etc.  At the end of the landing pad, control is transferred
+//! frees memory, etc. At the end of the landing pad, control is transferred
 //! back to the unwinder and unwinding resumes.
 //!
 //! Once stack has been unwound down to the handler frame level, unwinding stops
@@ -49,7 +39,7 @@
 //! ## `eh_personality` and `eh_unwind_resume`
 //!
 //! These language items are used by the compiler when generating unwind info.
-//! The first one is the personality routine described above.  The second one
+//! The first one is the personality routine described above. The second one
 //! allows compilation target to customize the process of resuming unwind at the
 //! end of the landing pads. `eh_unwind_resume` is used only if
 //! `custom_unwind_resume` flag in the target options is set.
@@ -62,19 +52,19 @@ use alloc::boxed::Box;
 
 use unwind as uw;
 use libc::{c_int, uintptr_t};
-use dwarf::eh::{self, EHContext, EHAction};
+use crate::dwarf::eh::{self, EHContext, EHAction};
 
 #[repr(C)]
 struct Exception {
     _uwe: uw::_Unwind_Exception,
-    cause: Option<Box<Any + Send>>,
+    cause: Option<Box<dyn Any + Send>>,
 }
 
-pub unsafe fn panic(data: Box<Any + Send>) -> u32 {
+pub unsafe fn panic(data: Box<dyn Any + Send>) -> u32 {
     let exception = Box::new(Exception {
         _uwe: uw::_Unwind_Exception {
             exception_class: rust_exception_class(),
-            exception_cleanup: exception_cleanup,
+            exception_cleanup,
             private: [0; uw::unwinder_private_data_size],
         },
         cause: Some(data),
@@ -94,7 +84,7 @@ pub fn payload() -> *mut u8 {
     ptr::null_mut()
 }
 
-pub unsafe fn cleanup(ptr: *mut u8) -> Box<Any + Send> {
+pub unsafe fn cleanup(ptr: *mut u8) -> Box<dyn Any + Send> {
     let my_ep = ptr as *mut Exception;
     let cause = (*my_ep).cause.take();
     uw::_Unwind_DeleteException(ptr as *mut _);
@@ -136,6 +126,9 @@ const UNWIND_DATA_REG: (i32, i32) = (6, 7); // R6, R7
 #[cfg(target_arch = "sparc64")]
 const UNWIND_DATA_REG: (i32, i32) = (24, 25); // I0, I1
 
+#[cfg(target_arch = "hexagon")]
+const UNWIND_DATA_REG: (i32, i32) = (0, 1); // R0, R1
+
 // The following code is based on GCC's C and C++ personality routines.  For reference, see:
 // https://github.com/gcc-mirror/gcc/blob/master/libstdc++-v3/libsupc++/eh_personality.cc
 // https://github.com/gcc-mirror/gcc/blob/trunk/libgcc/unwind-c.c
@@ -143,7 +136,7 @@ const UNWIND_DATA_REG: (i32, i32) = (24, 25); // I0, I1
 // The personality routine for most of our targets, except ARM, which has a slightly different ABI
 // (however, iOS goes here as it uses SjLj unwinding).  Also, the 64-bit Windows implementation
 // lives in seh64_gnu.rs
-#[cfg(all(any(target_os = "ios", not(target_arch = "arm"))))]
+#[cfg(all(any(target_os = "ios", target_os = "netbsd", not(target_arch = "arm"))))]
 #[lang = "eh_personality"]
 #[no_mangle]
 #[allow(unused)]
@@ -156,7 +149,10 @@ unsafe extern "C" fn rust_eh_personality(version: c_int,
     if version != 1 {
         return uw::_URC_FATAL_PHASE1_ERROR;
     }
-    let eh_action = find_eh_action(context);
+    let eh_action = match find_eh_action(context) {
+        Ok(action) => action,
+        Err(_) => return uw::_URC_FATAL_PHASE1_ERROR,
+    };
     if actions as i32 & uw::_UA_SEARCH_PHASE as i32 != 0 {
         match eh_action {
             EHAction::None |
@@ -181,7 +177,7 @@ unsafe extern "C" fn rust_eh_personality(version: c_int,
 
 // ARM EHABI personality routine.
 // http://infocenter.arm.com/help/topic/com.arm.doc.ihi0038b/IHI0038B_ehabi.pdf
-#[cfg(all(target_arch = "arm", not(target_os = "ios")))]
+#[cfg(all(target_arch = "arm", not(target_os = "ios"), not(target_os = "netbsd")))]
 #[lang = "eh_personality"]
 #[no_mangle]
 unsafe extern "C" fn rust_eh_personality(state: uw::_Unwind_State,
@@ -219,7 +215,10 @@ unsafe extern "C" fn rust_eh_personality(state: uw::_Unwind_State,
     // _Unwind_Context in our libunwind bindings and fetch the required data from there directly,
     // bypassing DWARF compatibility functions.
 
-    let eh_action = find_eh_action(context);
+    let eh_action = match find_eh_action(context) {
+        Ok(action) => action,
+        Err(_) => return uw::_URC_FAILURE,
+    };
     if search_phase {
         match eh_action {
             EHAction::None |
@@ -260,7 +259,9 @@ unsafe extern "C" fn rust_eh_personality(state: uw::_Unwind_State,
     }
 }
 
-unsafe fn find_eh_action(context: *mut uw::_Unwind_Context) -> EHAction {
+unsafe fn find_eh_action(context: *mut uw::_Unwind_Context)
+    -> Result<EHAction, ()>
+{
     let lsda = uw::_Unwind_GetLanguageSpecificData(context) as *const u8;
     let mut ip_before_instr: c_int = 0;
     let ip = uw::_Unwind_GetIPInfo(context, &mut ip_before_instr);
@@ -278,7 +279,7 @@ unsafe fn find_eh_action(context: *mut uw::_Unwind_Context) -> EHAction {
 // See docs in the `unwind` module.
 #[cfg(all(target_os="windows", target_arch = "x86", target_env="gnu"))]
 #[lang = "eh_unwind_resume"]
-#[unwind]
+#[unwind(allowed)]
 unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: *mut u8) -> ! {
     uw::_Unwind_Resume(panic_ctx as *mut uw::_Unwind_Exception);
 }
@@ -288,7 +289,7 @@ unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: *mut u8) -> ! {
 // Each module's image contains a frame unwind info section (usually
 // ".eh_frame").  When a module is loaded/unloaded into the process, the
 // unwinder must be informed about the location of this section in memory. The
-// methods of achieving that vary by the platform.  On some (e.g. Linux), the
+// methods of achieving that vary by the platform.  On some (e.g., Linux), the
 // unwinder can discover unwind info sections on its own (by dynamically
 // enumerating currently loaded modules via the dl_iterate_phdr() API and
 // finding their ".eh_frame" sections); Others, like Windows, require modules
@@ -301,10 +302,6 @@ unsafe extern "C" fn rust_eh_unwind_resume(panic_ctx: *mut u8) -> ! {
 // with any GCC runtime.
 #[cfg(all(target_os="windows", target_arch = "x86", target_env="gnu"))]
 pub mod eh_frame_registry {
-    #[link(name = "gcc_eh")]
-    #[cfg(not(cargobuild))]
-    extern "C" {}
-
     extern "C" {
         fn __register_frame_info(eh_frame_begin: *const u8, object: *mut u8);
         fn __deregister_frame_info(eh_frame_begin: *const u8, object: *mut u8);

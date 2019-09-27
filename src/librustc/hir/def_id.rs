@@ -1,141 +1,190 @@
-// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-use ty;
-
+use crate::ty::{self, TyCtxt};
 use rustc_data_structures::indexed_vec::Idx;
-use serialize::{self, Encoder, Decoder};
-
 use std::fmt;
 use std::u32;
 
-#[derive(Clone, Copy, Eq, Ord, PartialOrd, PartialEq, Hash, Debug)]
-pub struct CrateNum(u32);
-
-impl Idx for CrateNum {
-    fn new(value: usize) -> Self {
-        assert!(value < (u32::MAX) as usize);
-        CrateNum(value as u32)
-    }
-
-    fn index(self) -> usize {
-        self.0 as usize
+newtype_index! {
+    pub struct CrateId {
+        ENCODABLE = custom
     }
 }
 
-/// Item definitions in the currently-compiled crate would have the CrateNum
-/// LOCAL_CRATE in their DefId.
-pub const LOCAL_CRATE: CrateNum = CrateNum(0);
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CrateNum {
+    /// A special `CrateNum` that we use for the `tcx.rcache` when decoding from
+    /// the incr. comp. cache.
+    ReservedForIncrCompCache,
+    Index(CrateId),
+}
 
-/// Virtual crate for builtin macros
-// FIXME(jseyfried): this is also used for custom derives until proc-macro crates get `CrateNum`s.
-pub const BUILTIN_MACROS_CRATE: CrateNum = CrateNum(!0);
+impl ::std::fmt::Debug for CrateNum {
+    fn fmt(&self, fmt: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            CrateNum::Index(id) => write!(fmt, "crate{}", id.private),
+            CrateNum::ReservedForIncrCompCache => write!(fmt, "crate for decoding incr comp cache"),
+        }
+    }
+}
+
+/// Item definitions in the currently-compiled crate would have the `CrateNum`
+/// `LOCAL_CRATE` in their `DefId`.
+pub const LOCAL_CRATE: CrateNum = CrateNum::Index(CrateId::from_u32_const(0));
+
+impl Idx for CrateNum {
+    #[inline]
+    fn new(value: usize) -> Self {
+        CrateNum::Index(Idx::new(value))
+    }
+
+    #[inline]
+    fn index(self) -> usize {
+        match self {
+            CrateNum::Index(idx) => Idx::index(idx),
+            _ => bug!("Tried to get crate index of {:?}", self),
+        }
+    }
+}
 
 impl CrateNum {
     pub fn new(x: usize) -> CrateNum {
-        assert!(x < (u32::MAX as usize));
-        CrateNum(x as u32)
+        CrateNum::from_usize(x)
+    }
+
+    pub fn from_usize(x: usize) -> CrateNum {
+        CrateNum::Index(CrateId::from_usize(x))
     }
 
     pub fn from_u32(x: u32) -> CrateNum {
-        CrateNum(x)
+        CrateNum::Index(CrateId::from_u32(x))
     }
 
-    pub fn as_usize(&self) -> usize {
-        self.0 as usize
+    pub fn as_usize(self) -> usize {
+        match self {
+            CrateNum::Index(id) => id.as_usize(),
+            _ => bug!("tried to get index of non-standard crate {:?}", self),
+        }
     }
 
-    pub fn as_u32(&self) -> u32 {
-        self.0
+    pub fn as_u32(self) -> u32 {
+        match self {
+            CrateNum::Index(id) => id.as_u32(),
+            _ => bug!("tried to get index of non-standard crate {:?}", self),
+        }
     }
+
+    pub fn as_def_id(&self) -> DefId { DefId { krate: *self, index: CRATE_DEF_INDEX } }
 }
 
 impl fmt::Display for CrateNum {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&self.0, f)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CrateNum::Index(id) => fmt::Display::fmt(&id.private, f),
+            CrateNum::ReservedForIncrCompCache => write!(f, "crate for decoding incr comp cache"),
+        }
     }
 }
 
-impl serialize::UseSpecializedEncodable for CrateNum {
-    fn default_encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
-        s.emit_u32(self.0)
+impl rustc_serialize::UseSpecializedEncodable for CrateNum {}
+impl rustc_serialize::UseSpecializedDecodable for CrateNum {}
+
+newtype_index! {
+    /// A DefIndex is an index into the hir-map for a crate, identifying a
+    /// particular definition. It should really be considered an interned
+    /// shorthand for a particular DefPath.
+    pub struct DefIndex {
+        DEBUG_FORMAT = "DefIndex({})",
+
+        /// The crate root is always assigned index 0 by the AST Map code,
+        /// thanks to `NodeCollector::new`.
+        const CRATE_DEF_INDEX = 0,
     }
 }
 
-impl serialize::UseSpecializedDecodable for CrateNum {
-    fn default_decode<D: Decoder>(d: &mut D) -> Result<CrateNum, D::Error> {
-        d.read_u32().map(CrateNum)
-    }
-}
+impl rustc_serialize::UseSpecializedEncodable for DefIndex {}
+impl rustc_serialize::UseSpecializedDecodable for DefIndex {}
 
-/// A DefIndex is an index into the hir-map for a crate, identifying a
-/// particular definition. It should really be considered an interned
-/// shorthand for a particular DefPath.
-#[derive(Clone, Debug, Eq, Ord, PartialOrd, PartialEq, RustcEncodable,
-           RustcDecodable, Hash, Copy)]
-pub struct DefIndex(u32);
-
-impl DefIndex {
-    pub fn new(x: usize) -> DefIndex {
-        assert!(x < (u32::MAX as usize));
-        DefIndex(x as u32)
-    }
-
-    pub fn from_u32(x: u32) -> DefIndex {
-        DefIndex(x)
-    }
-
-    pub fn as_usize(&self) -> usize {
-        self.0 as usize
-    }
-
-    pub fn as_u32(&self) -> u32 {
-        self.0
-    }
-}
-
-/// The crate root is always assigned index 0 by the AST Map code,
-/// thanks to `NodeCollector::new`.
-pub const CRATE_DEF_INDEX: DefIndex = DefIndex(0);
-
-/// A DefId identifies a particular *definition*, by combining a crate
+/// A `DefId` identifies a particular *definition*, by combining a crate
 /// index and a def index.
-#[derive(Clone, Eq, Ord, PartialOrd, PartialEq, RustcEncodable, RustcDecodable, Hash, Copy)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Copy)]
 pub struct DefId {
     pub krate: CrateNum,
     pub index: DefIndex,
 }
 
 impl fmt::Debug for DefId {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "DefId {{ krate: {:?}, node: {:?}",
-               self.krate, self.index)?;
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DefId({}:{}", self.krate, self.index.index())?;
 
         ty::tls::with_opt(|opt_tcx| {
             if let Some(tcx) = opt_tcx {
-                write!(f, " => {}", tcx.def_path(*self).to_string(tcx))?;
+                write!(f, " ~ {}", tcx.def_path_debug_str(*self))?;
             }
             Ok(())
         })?;
 
-        write!(f, " }}")
+        write!(f, ")")
     }
 }
 
-
 impl DefId {
+    /// Makes a local `DefId` from the given `DefIndex`.
+    #[inline]
     pub fn local(index: DefIndex) -> DefId {
         DefId { krate: LOCAL_CRATE, index: index }
     }
 
-    pub fn is_local(&self) -> bool {
+    #[inline]
+    pub fn is_local(self) -> bool {
         self.krate == LOCAL_CRATE
     }
+
+    #[inline]
+    pub fn to_local(self) -> LocalDefId {
+        LocalDefId::from_def_id(self)
+    }
+
+    pub fn describe_as_module(&self, tcx: TyCtxt<'_>) -> String {
+        if self.is_local() && self.index == CRATE_DEF_INDEX {
+            format!("top-level module")
+        } else {
+            format!("module `{}`", tcx.def_path_str(*self))
+        }
+    }
 }
+
+impl rustc_serialize::UseSpecializedEncodable for DefId {}
+impl rustc_serialize::UseSpecializedDecodable for DefId {}
+
+/// A LocalDefId is equivalent to a DefId with `krate == LOCAL_CRATE`. Since
+/// we encode this information in the type, we can ensure at compile time that
+/// no DefIds from upstream crates get thrown into the mix. There are quite a
+/// few cases where we know that only DefIds from the local crate are expected
+/// and a DefId from a different crate would signify a bug somewhere. This
+/// is when LocalDefId comes in handy.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LocalDefId(DefIndex);
+
+impl LocalDefId {
+    #[inline]
+    pub fn from_def_id(def_id: DefId) -> LocalDefId {
+        assert!(def_id.is_local());
+        LocalDefId(def_id.index)
+    }
+
+    #[inline]
+    pub fn to_def_id(self) -> DefId {
+        DefId {
+            krate: LOCAL_CRATE,
+            index: self.0
+        }
+    }
+}
+
+impl fmt::Debug for LocalDefId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.to_def_id().fmt(f)
+    }
+}
+
+impl rustc_serialize::UseSpecializedEncodable for LocalDefId {}
+impl rustc_serialize::UseSpecializedDecodable for LocalDefId {}

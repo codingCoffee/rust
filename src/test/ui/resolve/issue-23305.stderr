@@ -1,16 +1,16 @@
-error[E0411]: cannot find type `Self` in this scope
-  --> $DIR/issue-23305.rs:15:12
+error[E0391]: cycle detected when processing `<impl at $DIR/issue-23305.rs:5:1: 5:24>`
+  --> $DIR/issue-23305.rs:5:16
    |
-15 | impl ToNbt<Self> {}
-   |            ^^^^ `Self` is only available in traits and impls
-
-error[E0038]: the trait `ToNbt` cannot be made into an object
-  --> $DIR/issue-23305.rs:15:6
+LL | impl dyn ToNbt<Self> {}
+   |                ^^^^
    |
-15 | impl ToNbt<Self> {}
-   |      ^^^^^^^^^^^ the trait `ToNbt` cannot be made into an object
+   = note: ...which again requires processing `<impl at $DIR/issue-23305.rs:5:1: 5:24>`, completing the cycle
+note: cycle used when collecting item types in top-level module
+  --> $DIR/issue-23305.rs:1:1
    |
-   = note: method `new` has no receiver
+LL | pub trait ToNbt<T> {
+   | ^^^^^^^^^^^^^^^^^^
 
 error: aborting due to previous error
 
+For more information about this error, try `rustc --explain E0391`.

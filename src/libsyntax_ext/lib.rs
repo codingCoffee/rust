@@ -1,120 +1,111 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+//! This crate contains implementations of built-in macros and other code generating facilities
+//! injecting code into the crate before it is lowered to HIR.
 
-//! Syntax extensions in the Rust compiler.
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 
-#![crate_name = "syntax_ext"]
-#![unstable(feature = "rustc_private", issue = "27812")]
-#![crate_type = "dylib"]
-#![crate_type = "rlib"]
-#![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
-       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
-       html_root_url = "https://doc.rust-lang.org/nightly/")]
-#![deny(warnings)]
-
+#![feature(crate_visibility_modifier)]
+#![feature(decl_macro)]
+#![feature(mem_take)]
+#![feature(nll)]
 #![feature(proc_macro_internals)]
-#![feature(rustc_private)]
-#![feature(staged_api)]
+#![feature(proc_macro_quote)]
 
-extern crate fmt_macros;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate syntax;
-extern crate syntax_pos;
 extern crate proc_macro;
-extern crate rustc_errors as errors;
+
+use crate::deriving::*;
+
+use syntax::ast::Ident;
+use syntax::edition::Edition;
+use syntax::ext::base::{SyntaxExtension, SyntaxExtensionKind, MacroExpanderFn};
+use syntax::ext::proc_macro::BangProcMacro;
+use syntax::symbol::sym;
+
+mod error_codes;
 
 mod asm;
+mod assert;
 mod cfg;
+mod compile_error;
 mod concat;
 mod concat_idents;
+mod deriving;
 mod env;
 mod format;
 mod format_foreign;
+mod global_allocator;
+mod global_asm;
 mod log_syntax;
+mod source_util;
+mod test;
 mod trace_macros;
 
-pub mod proc_macro_registrar;
+pub mod cmdline_attrs;
+pub mod plugin_macro_defs;
+pub mod proc_macro_harness;
+pub mod standard_library_imports;
+pub mod test_harness;
 
-// for custom_derive
-pub mod deriving;
-
-pub mod proc_macro_impl;
-
-use std::rc::Rc;
-use syntax::ast;
-use syntax::ext::base::{MacroExpanderFn, NormalTT, MultiModifier, NamedSyntaxExtension};
-use syntax::symbol::Symbol;
-
-pub fn register_builtins(resolver: &mut syntax::ext::base::Resolver,
-                         user_exts: Vec<NamedSyntaxExtension>,
-                         enable_quotes: bool) {
-    let mut register = |name, ext| {
-        resolver.add_ext(ast::Ident::with_empty_ctxt(name), Rc::new(ext));
-    };
-
-    macro_rules! register {
-        ($( $name:ident: $f:expr, )*) => { $(
-            register(Symbol::intern(stringify!($name)),
-                     NormalTT(Box::new($f as MacroExpanderFn), None, false));
-        )* }
+pub fn register_builtin_macros(resolver: &mut dyn syntax::ext::base::Resolver, edition: Edition) {
+    let mut register = |name, kind| resolver.register_builtin_macro(
+        Ident::with_dummy_span(name), SyntaxExtension {
+            is_builtin: true, ..SyntaxExtension::default(kind, edition)
+        },
+    );
+    macro register_bang($($name:ident: $f:expr,)*) {
+        $(register(sym::$name, SyntaxExtensionKind::LegacyBang(Box::new($f as MacroExpanderFn)));)*
+    }
+    macro register_attr($($name:ident: $f:expr,)*) {
+        $(register(sym::$name, SyntaxExtensionKind::LegacyAttr(Box::new($f)));)*
+    }
+    macro register_derive($($name:ident: $f:expr,)*) {
+        $(register(sym::$name, SyntaxExtensionKind::LegacyDerive(Box::new(BuiltinDerive($f))));)*
     }
 
-    if enable_quotes {
-        use syntax::ext::quote::*;
-        register! {
-            quote_tokens: expand_quote_tokens,
-            quote_expr: expand_quote_expr,
-            quote_ty: expand_quote_ty,
-            quote_item: expand_quote_item,
-            quote_pat: expand_quote_pat,
-            quote_arm: expand_quote_arm,
-            quote_stmt: expand_quote_stmt,
-            quote_matcher: expand_quote_matcher,
-            quote_attr: expand_quote_attr,
-            quote_arg: expand_quote_arg,
-            quote_block: expand_quote_block,
-            quote_meta_item: expand_quote_meta_item,
-            quote_path: expand_quote_path,
-        }
-    }
-
-    use syntax::ext::source_util::*;
-    register! {
-        line: expand_line,
-        column: expand_column,
-        file: expand_file,
-        stringify: expand_stringify,
-        include: expand_include,
-        include_str: expand_include_str,
-        include_bytes: expand_include_bytes,
-        module_path: expand_mod,
-
+    register_bang! {
         asm: asm::expand_asm,
+        assert: assert::expand_assert,
         cfg: cfg::expand_cfg,
-        concat: concat::expand_syntax_ext,
-        concat_idents: concat_idents::expand_syntax_ext,
+        column: source_util::expand_column,
+        compile_error: compile_error::expand_compile_error,
+        concat_idents: concat_idents::expand_concat_idents,
+        concat: concat::expand_concat,
         env: env::expand_env,
+        file: source_util::expand_file,
+        format_args_nl: format::expand_format_args_nl,
+        format_args: format::expand_format_args,
+        global_asm: global_asm::expand_global_asm,
+        include_bytes: source_util::expand_include_bytes,
+        include_str: source_util::expand_include_str,
+        include: source_util::expand_include,
+        line: source_util::expand_line,
+        log_syntax: log_syntax::expand_log_syntax,
+        module_path: source_util::expand_mod,
         option_env: env::expand_option_env,
-        log_syntax: log_syntax::expand_syntax_ext,
+        stringify: source_util::expand_stringify,
         trace_macros: trace_macros::expand_trace_macros,
     }
 
-    // format_args uses `unstable` things internally.
-    register(Symbol::intern("format_args"),
-             NormalTT(Box::new(format::expand_format_args), None, true));
-
-    register(Symbol::intern("derive"), MultiModifier(Box::new(deriving::expand_derive)));
-
-    for (name, ext) in user_exts {
-        register(name, ext);
+    register_attr! {
+        bench: test::expand_bench,
+        global_allocator: global_allocator::expand,
+        test: test::expand_test,
+        test_case: test::expand_test_case,
     }
+
+    register_derive! {
+        Clone: clone::expand_deriving_clone,
+        Copy: bounds::expand_deriving_copy,
+        Debug: debug::expand_deriving_debug,
+        Default: default::expand_deriving_default,
+        Eq: eq::expand_deriving_eq,
+        Hash: hash::expand_deriving_hash,
+        Ord: ord::expand_deriving_ord,
+        PartialEq: partial_eq::expand_deriving_partial_eq,
+        PartialOrd: partial_ord::expand_deriving_partial_ord,
+        RustcDecodable: decodable::expand_deriving_rustc_decodable,
+        RustcEncodable: encodable::expand_deriving_rustc_encodable,
+    }
+
+    let client = proc_macro::bridge::client::Client::expand1(proc_macro::quote);
+    register(sym::quote, SyntaxExtensionKind::Bang(Box::new(BangProcMacro { client })));
 }

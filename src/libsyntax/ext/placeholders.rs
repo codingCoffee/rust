@@ -1,76 +1,162 @@
-// Copyright 2016 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+use crate::ast::{self, NodeId};
+use crate::source_map::{DUMMY_SP, dummy_spanned};
+use crate::ext::base::ExtCtxt;
+use crate::ext::expand::{AstFragment, AstFragmentKind};
+use crate::tokenstream::TokenStream;
+use crate::mut_visit::*;
+use crate::ptr::P;
+use crate::ThinVec;
 
-use ast;
-use codemap::{DUMMY_SP, dummy_spanned};
-use ext::base::ExtCtxt;
-use ext::expand::{Expansion, ExpansionKind};
-use ext::hygiene::Mark;
-use fold::*;
-use ptr::P;
-use symbol::keywords;
-use util::move_map::MoveMap;
-use util::small_vector::SmallVector;
+use smallvec::{smallvec, SmallVec};
 
-use std::collections::HashMap;
-use std::mem;
+use rustc_data_structures::fx::FxHashMap;
 
-pub fn placeholder(kind: ExpansionKind, id: ast::NodeId) -> Expansion {
+pub fn placeholder(kind: AstFragmentKind, id: ast::NodeId) -> AstFragment {
     fn mac_placeholder() -> ast::Mac {
-        dummy_spanned(ast::Mac_ {
+        ast::Mac {
             path: ast::Path { span: DUMMY_SP, segments: Vec::new() },
-            tts: Vec::new(),
-        })
+            tts: TokenStream::empty().into(),
+            delim: ast::MacDelimiter::Brace,
+            span: DUMMY_SP,
+            prior_type_ascription: None,
+        }
     }
 
-    let ident = keywords::Invalid.ident();
+    let ident = ast::Ident::invalid();
     let attrs = Vec::new();
-    let vis = ast::Visibility::Inherited;
+    let generics = ast::Generics::default();
+    let vis = dummy_spanned(ast::VisibilityKind::Inherited);
     let span = DUMMY_SP;
     let expr_placeholder = || P(ast::Expr {
-        id: id, span: span,
-        attrs: ast::ThinVec::new(),
-        node: ast::ExprKind::Mac(mac_placeholder()),
+        id, span,
+        attrs: ThinVec::new(),
+        kind: ast::ExprKind::Mac(mac_placeholder()),
+    });
+    let ty = P(ast::Ty {
+        id,
+        kind: ast::TyKind::Mac(mac_placeholder()),
+        span,
+    });
+    let pat = P(ast::Pat {
+        id,
+        kind: ast::PatKind::Mac(mac_placeholder()),
+        span,
     });
 
     match kind {
-        ExpansionKind::Expr => Expansion::Expr(expr_placeholder()),
-        ExpansionKind::OptExpr => Expansion::OptExpr(Some(expr_placeholder())),
-        ExpansionKind::Items => Expansion::Items(SmallVector::one(P(ast::Item {
-            id: id, span: span, ident: ident, vis: vis, attrs: attrs,
-            node: ast::ItemKind::Mac(mac_placeholder()),
-        }))),
-        ExpansionKind::TraitItems => Expansion::TraitItems(SmallVector::one(ast::TraitItem {
-            id: id, span: span, ident: ident, attrs: attrs,
-            node: ast::TraitItemKind::Macro(mac_placeholder()),
-        })),
-        ExpansionKind::ImplItems => Expansion::ImplItems(SmallVector::one(ast::ImplItem {
-            id: id, span: span, ident: ident, vis: vis, attrs: attrs,
-            node: ast::ImplItemKind::Macro(mac_placeholder()),
+        AstFragmentKind::Expr => AstFragment::Expr(expr_placeholder()),
+        AstFragmentKind::OptExpr => AstFragment::OptExpr(Some(expr_placeholder())),
+        AstFragmentKind::Items => AstFragment::Items(smallvec![P(ast::Item {
+            id, span, ident, vis, attrs,
+            kind: ast::ItemKind::Mac(mac_placeholder()),
+            tokens: None,
+        })]),
+        AstFragmentKind::TraitItems => AstFragment::TraitItems(smallvec![ast::TraitItem {
+            id, span, ident, attrs, generics,
+            kind: ast::TraitItemKind::Macro(mac_placeholder()),
+            tokens: None,
+        }]),
+        AstFragmentKind::ImplItems => AstFragment::ImplItems(smallvec![ast::ImplItem {
+            id, span, ident, vis, attrs, generics,
+            kind: ast::ImplItemKind::Macro(mac_placeholder()),
             defaultness: ast::Defaultness::Final,
+            tokens: None,
+        }]),
+        AstFragmentKind::ForeignItems =>
+            AstFragment::ForeignItems(smallvec![ast::ForeignItem {
+                id, span, ident, vis, attrs,
+                kind: ast::ForeignItemKind::Macro(mac_placeholder()),
+            }]),
+        AstFragmentKind::Pat => AstFragment::Pat(P(ast::Pat {
+            id, span, kind: ast::PatKind::Mac(mac_placeholder()),
         })),
-        ExpansionKind::Pat => Expansion::Pat(P(ast::Pat {
-            id: id, span: span, node: ast::PatKind::Mac(mac_placeholder()),
+        AstFragmentKind::Ty => AstFragment::Ty(P(ast::Ty {
+            id, span, kind: ast::TyKind::Mac(mac_placeholder()),
         })),
-        ExpansionKind::Ty => Expansion::Ty(P(ast::Ty {
-            id: id, span: span, node: ast::TyKind::Mac(mac_placeholder()),
-        })),
-        ExpansionKind::Stmts => Expansion::Stmts(SmallVector::one({
-            let mac = P((mac_placeholder(), ast::MacStmtStyle::Braces, ast::ThinVec::new()));
-            ast::Stmt { id: id, span: span, node: ast::StmtKind::Mac(mac) }
-        })),
+        AstFragmentKind::Stmts => AstFragment::Stmts(smallvec![{
+            let mac = P((mac_placeholder(), ast::MacStmtStyle::Braces, ThinVec::new()));
+            ast::Stmt { id, span, kind: ast::StmtKind::Mac(mac) }
+        }]),
+        AstFragmentKind::Arms => AstFragment::Arms(smallvec![
+            ast::Arm {
+                attrs: Default::default(),
+                body: expr_placeholder(),
+                guard: None,
+                id,
+                pat,
+                span,
+                is_placeholder: true,
+            }
+        ]),
+        AstFragmentKind::Fields => AstFragment::Fields(smallvec![
+            ast::Field {
+                attrs: Default::default(),
+                expr: expr_placeholder(),
+                id,
+                ident,
+                is_shorthand: false,
+                span,
+                is_placeholder: true,
+            }
+        ]),
+        AstFragmentKind::FieldPats => AstFragment::FieldPats(smallvec![
+            ast::FieldPat {
+                attrs: Default::default(),
+                id,
+                ident,
+                is_shorthand: false,
+                pat,
+                span,
+                is_placeholder: true,
+            }
+        ]),
+        AstFragmentKind::GenericParams => AstFragment::GenericParams(smallvec![{
+            ast::GenericParam {
+                attrs: Default::default(),
+                bounds: Default::default(),
+                id,
+                ident,
+                is_placeholder: true,
+                kind: ast::GenericParamKind::Lifetime,
+            }
+        }]),
+        AstFragmentKind::Params => AstFragment::Params(smallvec![
+            ast::Param {
+                attrs: Default::default(),
+                id,
+                pat,
+                span,
+                ty,
+                is_placeholder: true,
+            }
+        ]),
+        AstFragmentKind::StructFields => AstFragment::StructFields(smallvec![
+            ast::StructField {
+                attrs: Default::default(),
+                id,
+                ident: None,
+                span,
+                ty,
+                vis,
+                is_placeholder: true,
+            }
+        ]),
+        AstFragmentKind::Variants => AstFragment::Variants(smallvec![
+            ast::Variant {
+                attrs: Default::default(),
+                data: ast::VariantData::Struct(Default::default(), false),
+                disr_expr: None,
+                id,
+                ident,
+                span,
+                is_placeholder: true,
+            }
+        ])
     }
 }
 
-pub struct PlaceholderExpander<'a, 'b: 'a> {
-    expansions: HashMap<ast::NodeId, Expansion>,
+pub struct PlaceholderExpander<'a, 'b> {
+    expanded_fragments: FxHashMap<ast::NodeId, AstFragment>,
     cx: &'a mut ExtCtxt<'b>,
     monotonic: bool,
 }
@@ -78,141 +164,186 @@ pub struct PlaceholderExpander<'a, 'b: 'a> {
 impl<'a, 'b> PlaceholderExpander<'a, 'b> {
     pub fn new(cx: &'a mut ExtCtxt<'b>, monotonic: bool) -> Self {
         PlaceholderExpander {
-            cx: cx,
-            expansions: HashMap::new(),
-            monotonic: monotonic,
+            cx,
+            expanded_fragments: FxHashMap::default(),
+            monotonic,
         }
     }
 
-    pub fn add(&mut self, id: ast::NodeId, expansion: Expansion) {
-        let expansion = expansion.fold_with(self);
-        self.expansions.insert(id, expansion);
+    pub fn add(&mut self, id: ast::NodeId, mut fragment: AstFragment, placeholders: Vec<NodeId>) {
+        fragment.mut_visit_with(self);
+        if let AstFragment::Items(mut items) = fragment {
+            for placeholder in placeholders {
+                match self.remove(placeholder) {
+                    AstFragment::Items(derived_items) => items.extend(derived_items),
+                    _ => unreachable!(),
+                }
+            }
+            fragment = AstFragment::Items(items);
+        }
+        self.expanded_fragments.insert(id, fragment);
     }
 
-    fn remove(&mut self, id: ast::NodeId) -> Expansion {
-        self.expansions.remove(&id).unwrap()
+    fn remove(&mut self, id: ast::NodeId) -> AstFragment {
+        self.expanded_fragments.remove(&id).unwrap()
     }
 }
 
-impl<'a, 'b> Folder for PlaceholderExpander<'a, 'b> {
-    fn fold_item(&mut self, item: P<ast::Item>) -> SmallVector<P<ast::Item>> {
-        match item.node {
-            ast::ItemKind::Mac(ref mac) if !mac.node.path.segments.is_empty() => {}
+impl<'a, 'b> MutVisitor for PlaceholderExpander<'a, 'b> {
+    fn flat_map_arm(&mut self, arm: ast::Arm) -> SmallVec<[ast::Arm; 1]> {
+        if arm.is_placeholder {
+            self.remove(arm.id).make_arms()
+        } else {
+            noop_flat_map_arm(arm, self)
+        }
+    }
+
+    fn flat_map_field(&mut self, field: ast::Field) -> SmallVec<[ast::Field; 1]> {
+        if field.is_placeholder {
+            self.remove(field.id).make_fields()
+        } else {
+            noop_flat_map_field(field, self)
+        }
+    }
+
+    fn flat_map_field_pattern(&mut self, fp: ast::FieldPat) -> SmallVec<[ast::FieldPat; 1]> {
+        if fp.is_placeholder {
+            self.remove(fp.id).make_field_patterns()
+        } else {
+            noop_flat_map_field_pattern(fp, self)
+        }
+    }
+
+    fn flat_map_generic_param(
+        &mut self,
+        param: ast::GenericParam
+    ) -> SmallVec<[ast::GenericParam; 1]>
+    {
+        if param.is_placeholder {
+            self.remove(param.id).make_generic_params()
+        } else {
+            noop_flat_map_generic_param(param, self)
+        }
+    }
+
+    fn flat_map_param(&mut self, p: ast::Param) -> SmallVec<[ast::Param; 1]> {
+        if p.is_placeholder {
+            self.remove(p.id).make_params()
+        } else {
+            noop_flat_map_param(p, self)
+        }
+    }
+
+    fn flat_map_struct_field(&mut self, sf: ast::StructField) -> SmallVec<[ast::StructField; 1]> {
+        if sf.is_placeholder {
+            self.remove(sf.id).make_struct_fields()
+        } else {
+            noop_flat_map_struct_field(sf, self)
+        }
+    }
+
+    fn flat_map_variant(&mut self, variant: ast::Variant) -> SmallVec<[ast::Variant; 1]> {
+        if variant.is_placeholder {
+            self.remove(variant.id).make_variants()
+        } else {
+            noop_flat_map_variant(variant, self)
+        }
+    }
+
+    fn flat_map_item(&mut self, item: P<ast::Item>) -> SmallVec<[P<ast::Item>; 1]> {
+        match item.kind {
             ast::ItemKind::Mac(_) => return self.remove(item.id).make_items(),
+            ast::ItemKind::MacroDef(_) => return smallvec![item],
             _ => {}
         }
 
-        noop_fold_item(item, self)
+        noop_flat_map_item(item, self)
     }
 
-    fn fold_trait_item(&mut self, item: ast::TraitItem) -> SmallVector<ast::TraitItem> {
-        match item.node {
+    fn flat_map_trait_item(&mut self, item: ast::TraitItem) -> SmallVec<[ast::TraitItem; 1]> {
+        match item.kind {
             ast::TraitItemKind::Macro(_) => self.remove(item.id).make_trait_items(),
-            _ => noop_fold_trait_item(item, self),
+            _ => noop_flat_map_trait_item(item, self),
         }
     }
 
-    fn fold_impl_item(&mut self, item: ast::ImplItem) -> SmallVector<ast::ImplItem> {
-        match item.node {
+    fn flat_map_impl_item(&mut self, item: ast::ImplItem) -> SmallVec<[ast::ImplItem; 1]> {
+        match item.kind {
             ast::ImplItemKind::Macro(_) => self.remove(item.id).make_impl_items(),
-            _ => noop_fold_impl_item(item, self),
+            _ => noop_flat_map_impl_item(item, self),
         }
     }
 
-    fn fold_expr(&mut self, expr: P<ast::Expr>) -> P<ast::Expr> {
-        match expr.node {
-            ast::ExprKind::Mac(_) => self.remove(expr.id).make_expr(),
-            _ => expr.map(|expr| noop_fold_expr(expr, self)),
+    fn flat_map_foreign_item(&mut self, item: ast::ForeignItem) -> SmallVec<[ast::ForeignItem; 1]> {
+        match item.kind {
+            ast::ForeignItemKind::Macro(_) => self.remove(item.id).make_foreign_items(),
+            _ => noop_flat_map_foreign_item(item, self),
         }
     }
 
-    fn fold_opt_expr(&mut self, expr: P<ast::Expr>) -> Option<P<ast::Expr>> {
-        match expr.node {
+    fn visit_expr(&mut self, expr: &mut P<ast::Expr>) {
+        match expr.kind {
+            ast::ExprKind::Mac(_) => *expr = self.remove(expr.id).make_expr(),
+            _ => noop_visit_expr(expr, self),
+        }
+    }
+
+    fn filter_map_expr(&mut self, expr: P<ast::Expr>) -> Option<P<ast::Expr>> {
+        match expr.kind {
             ast::ExprKind::Mac(_) => self.remove(expr.id).make_opt_expr(),
-            _ => noop_fold_opt_expr(expr, self),
+            _ => noop_filter_map_expr(expr, self),
         }
     }
 
-    fn fold_stmt(&mut self, stmt: ast::Stmt) -> SmallVector<ast::Stmt> {
-        let (style, mut expansion) = match stmt.node {
+    fn flat_map_stmt(&mut self, stmt: ast::Stmt) -> SmallVec<[ast::Stmt; 1]> {
+        let (style, mut stmts) = match stmt.kind {
             ast::StmtKind::Mac(mac) => (mac.1, self.remove(stmt.id).make_stmts()),
-            _ => return noop_fold_stmt(stmt, self),
+            _ => return noop_flat_map_stmt(stmt, self),
         };
 
         if style == ast::MacStmtStyle::Semicolon {
-            if let Some(stmt) = expansion.pop() {
-                expansion.push(stmt.add_trailing_semicolon());
+            if let Some(stmt) = stmts.pop() {
+                stmts.push(stmt.add_trailing_semicolon());
             }
         }
 
-        expansion
+        stmts
     }
 
-    fn fold_pat(&mut self, pat: P<ast::Pat>) -> P<ast::Pat> {
-        match pat.node {
-            ast::PatKind::Mac(_) => self.remove(pat.id).make_pat(),
-            _ => noop_fold_pat(pat, self),
+    fn visit_pat(&mut self, pat: &mut P<ast::Pat>) {
+        match pat.kind {
+            ast::PatKind::Mac(_) => *pat = self.remove(pat.id).make_pat(),
+            _ => noop_visit_pat(pat, self),
         }
     }
 
-    fn fold_ty(&mut self, ty: P<ast::Ty>) -> P<ast::Ty> {
-        match ty.node {
-            ast::TyKind::Mac(_) => self.remove(ty.id).make_ty(),
-            _ => noop_fold_ty(ty, self),
+    fn visit_ty(&mut self, ty: &mut P<ast::Ty>) {
+        match ty.kind {
+            ast::TyKind::Mac(_) => *ty = self.remove(ty.id).make_ty(),
+            _ => noop_visit_ty(ty, self),
         }
     }
 
-    fn fold_block(&mut self, block: P<ast::Block>) -> P<ast::Block> {
-        noop_fold_block(block, self).map(|mut block| {
-            let mut macros = Vec::new();
-            let mut remaining_stmts = block.stmts.len();
+    fn visit_block(&mut self, block: &mut P<ast::Block>) {
+        noop_visit_block(block, self);
 
-            block.stmts = block.stmts.move_flat_map(|mut stmt| {
-                remaining_stmts -= 1;
-
-                // `macro_rules!` macro definition
-                if let ast::StmtKind::Item(ref item) = stmt.node {
-                    if let ast::ItemKind::Mac(_) = item.node {
-                        macros.push(Mark::from_placeholder_id(item.id));
-                        return None;
-                    }
-                }
-
-                match stmt.node {
-                    // Avoid wasting a node id on a trailing expression statement,
-                    // which shares a HIR node with the expression itself.
-                    ast::StmtKind::Expr(ref expr) if remaining_stmts == 0 => stmt.id = expr.id,
-
-                    _ if self.monotonic => {
-                        assert_eq!(stmt.id, ast::DUMMY_NODE_ID);
-                        stmt.id = self.cx.resolver.next_node_id();
-                    }
-
-                    _ => {}
-                }
-
-                if self.monotonic && !macros.is_empty() {
-                    let macros = mem::replace(&mut macros, Vec::new());
-                    self.cx.resolver.add_expansions_at_stmt(stmt.id, macros);
-                }
-
-                Some(stmt)
-            });
-
-            block
-        })
+        for stmt in block.stmts.iter_mut() {
+            if self.monotonic {
+                assert_eq!(stmt.id, ast::DUMMY_NODE_ID);
+                stmt.id = self.cx.resolver.next_node_id();
+            }
+        }
     }
 
-    fn fold_mod(&mut self, module: ast::Mod) -> ast::Mod {
-        let mut module = noop_fold_mod(module, self);
-        module.items = module.items.move_flat_map(|item| match item.node {
-            ast::ItemKind::Mac(_) if !self.cx.ecfg.keep_macs => None, // remove macro definitions
-            _ => Some(item),
+    fn visit_mod(&mut self, module: &mut ast::Mod) {
+        noop_visit_mod(module, self);
+        module.items.retain(|item| match item.kind {
+            ast::ItemKind::Mac(_) if !self.cx.ecfg.keep_macs => false, // remove macro definitions
+            _ => true,
         });
-        module
     }
 
-    fn fold_mac(&mut self, mac: ast::Mac) -> ast::Mac {
-        mac
+    fn visit_mac(&mut self, _mac: &mut ast::Mac) {
+        // Do nothing.
     }
 }

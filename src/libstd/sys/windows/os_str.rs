@@ -1,21 +1,13 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 /// The underlying OsString/OsStr implementation on Windows is a
 /// wrapper around the "WTF-8" encoding; see the `wtf8` module for more.
 
-use borrow::Cow;
-use fmt::{self, Debug};
-use sys_common::wtf8::{Wtf8, Wtf8Buf};
-use mem;
-use sys_common::{AsInner, IntoInner};
+use crate::borrow::Cow;
+use crate::fmt;
+use crate::sys_common::wtf8::{Wtf8, Wtf8Buf};
+use crate::mem;
+use crate::rc::Rc;
+use crate::sync::Arc;
+use crate::sys_common::{AsInner, IntoInner, FromInner};
 
 #[derive(Clone, Hash)]
 pub struct Buf {
@@ -28,15 +20,27 @@ impl IntoInner<Wtf8Buf> for Buf {
     }
 }
 
+impl FromInner<Wtf8Buf> for Buf {
+    fn from_inner(inner: Wtf8Buf) -> Self {
+        Buf { inner }
+    }
+}
+
 impl AsInner<Wtf8> for Buf {
     fn as_inner(&self) -> &Wtf8 {
         &self.inner
     }
 }
 
-impl Debug for Buf {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.as_slice().fmt(formatter)
+impl fmt::Debug for Buf {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_slice(), formatter)
+    }
+}
+
+impl fmt::Display for Buf {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_slice(), formatter)
     }
 }
 
@@ -44,9 +48,15 @@ pub struct Slice {
     pub inner: Wtf8
 }
 
-impl Debug for Slice {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.inner.fmt(formatter)
+impl fmt::Debug for Slice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, formatter)
+    }
+}
+
+impl fmt::Display for Slice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.inner, formatter)
     }
 }
 
@@ -88,6 +98,36 @@ impl Buf {
     pub fn reserve_exact(&mut self, additional: usize) {
         self.inner.reserve_exact(additional)
     }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.inner.shrink_to_fit()
+    }
+
+    #[inline]
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.inner.shrink_to(min_capacity)
+    }
+
+    #[inline]
+    pub fn into_box(self) -> Box<Slice> {
+        unsafe { mem::transmute(self.inner.into_box()) }
+    }
+
+    #[inline]
+    pub fn from_box(boxed: Box<Slice>) -> Buf {
+        let inner: Box<Wtf8> = unsafe { mem::transmute(boxed) };
+        Buf { inner: Wtf8Buf::from_box(inner) }
+    }
+
+    #[inline]
+    pub fn into_arc(&self) -> Arc<Slice> {
+        self.as_slice().into_arc()
+    }
+
+    #[inline]
+    pub fn into_rc(&self) -> Rc<Slice> {
+        self.as_slice().into_rc()
+    }
 }
 
 impl Slice {
@@ -99,7 +139,7 @@ impl Slice {
         self.inner.as_str()
     }
 
-    pub fn to_string_lossy(&self) -> Cow<str> {
+    pub fn to_string_lossy(&self) -> Cow<'_, str> {
         self.inner.to_string_lossy()
     }
 
@@ -107,5 +147,26 @@ impl Slice {
         let mut buf = Wtf8Buf::with_capacity(self.inner.len());
         buf.push_wtf8(&self.inner);
         Buf { inner: buf }
+    }
+
+    #[inline]
+    pub fn into_box(&self) -> Box<Slice> {
+        unsafe { mem::transmute(self.inner.into_box()) }
+    }
+
+    pub fn empty_box() -> Box<Slice> {
+        unsafe { mem::transmute(Wtf8::empty_box()) }
+    }
+
+    #[inline]
+    pub fn into_arc(&self) -> Arc<Slice> {
+        let arc = self.inner.into_arc();
+        unsafe { Arc::from_raw(Arc::into_raw(arc) as *const Slice) }
+    }
+
+    #[inline]
+    pub fn into_rc(&self) -> Rc<Slice> {
+        let rc = self.inner.into_rc();
+        unsafe { Rc::from_raw(Rc::into_raw(rc) as *const Slice) }
     }
 }

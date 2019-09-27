@@ -1,86 +1,106 @@
-// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+//! This module contains the fcuntaiontliy to convert from the wacky tcx data
+//! structures into the HAIR. The `builder` is generally ignorant of the tcx,
+//! etc., and instead goes through the `Cx` for most of its work.
 
-//! This module contains the code to convert from the wacky tcx data
-//! structures into the hair. The `builder` is generally ignorant of
-//! the tcx etc, and instead goes through the `Cx` for most of its
-//! work.
-//!
+use crate::hair::*;
+use crate::hair::util::UserAnnotatedTyHelpers;
 
-use hair::*;
-use rustc::mir::transform::MirSource;
-
-use rustc::middle::const_val::ConstVal;
-use rustc_const_eval::{ConstContext, EvalHint, fatal_const_eval_err};
 use rustc_data_structures::indexed_vec::Idx;
 use rustc::hir::def_id::DefId;
-use rustc::hir::map::blocks::FnLikeNode;
+use rustc::hir::Node;
+use rustc::middle::region;
 use rustc::infer::InferCtxt;
 use rustc::ty::subst::Subst;
 use rustc::ty::{self, Ty, TyCtxt};
-use syntax::symbol::{Symbol, InternedString};
+use rustc::ty::subst::{GenericArg, InternalSubsts};
+use rustc::ty::layout::VariantIdx;
+use syntax::ast;
+use syntax::attr;
+use syntax::symbol::{Symbol, sym};
 use rustc::hir;
-use rustc_const_math::{ConstInt, ConstUsize};
+use crate::hair::constant::{lit_to_const, LitToConstError};
 
-#[derive(Copy, Clone)]
-pub struct Cx<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
-    tcx: TyCtxt<'a, 'gcx, 'tcx>,
-    infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
+#[derive(Clone)]
+pub struct Cx<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    infcx: &'a InferCtxt<'a, 'tcx>,
+
+    pub root_lint_level: hir::HirId,
+    pub param_env: ty::ParamEnv<'tcx>,
+
+    /// Identity `InternalSubsts` for use with const-evaluation.
+    pub identity_substs: &'tcx InternalSubsts<'tcx>,
+
+    pub region_scope_tree: &'tcx region::ScopeTree,
+    pub tables: &'a ty::TypeckTables<'tcx>,
+
+    /// This is `Constness::Const` if we are compiling a `static`,
+    /// `const`, or the body of a `const fn`.
     constness: hir::Constness,
 
-    /// True if this constant/function needs overflow checks.
+    /// The `DefId` of the owner of this body.
+    body_owner: DefId,
+
+    /// What kind of body is being compiled.
+    pub body_owner_kind: hir::BodyOwnerKind,
+
+    /// Whether this constant/function needs overflow checks.
     check_overflow: bool,
+
+    /// See field with the same name on `mir::Body`.
+    control_flow_destroyed: Vec<(Span, String)>,
 }
 
-impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
-    pub fn new(infcx: &'a InferCtxt<'a, 'gcx, 'tcx>, src: MirSource) -> Cx<'a, 'gcx, 'tcx> {
-        let constness = match src {
-            MirSource::Const(_) |
-            MirSource::Static(..) => hir::Constness::Const,
-            MirSource::Fn(id) => {
-                let fn_like = FnLikeNode::from_node(infcx.tcx.map.get(id));
-                fn_like.map_or(hir::Constness::NotConst, |f| f.constness())
-            }
-            MirSource::Promoted(..) => bug!(),
+impl<'a, 'tcx> Cx<'a, 'tcx> {
+    pub fn new(infcx: &'a InferCtxt<'a, 'tcx>, src_id: hir::HirId) -> Cx<'a, 'tcx> {
+        let tcx = infcx.tcx;
+        let src_def_id = tcx.hir().local_def_id(src_id);
+        let tables = tcx.typeck_tables_of(src_def_id);
+        let body_owner_kind = tcx.hir().body_owner_kind(src_id);
+
+        let constness = match body_owner_kind {
+            hir::BodyOwnerKind::Const |
+            hir::BodyOwnerKind::Static(_) => hir::Constness::Const,
+            hir::BodyOwnerKind::Closure |
+            hir::BodyOwnerKind::Fn => hir::Constness::NotConst,
         };
 
-        let attrs = infcx.tcx.map.attrs(src.item_id());
+        let attrs = tcx.hir().attrs(src_id);
 
         // Some functions always have overflow checks enabled,
         // however, they may not get codegen'd, depending on
-        // the settings for the crate they are translated in.
-        let mut check_overflow = attrs.iter()
-            .any(|item| item.check_name("rustc_inherit_overflow_checks"));
+        // the settings for the crate they are codegened in.
+        let mut check_overflow = attr::contains_name(attrs, sym::rustc_inherit_overflow_checks);
 
-        // Respect -Z force-overflow-checks=on and -C debug-assertions.
-        check_overflow |= infcx.tcx
-            .sess
-            .opts
-            .debugging_opts
-            .force_overflow_checks
-            .unwrap_or(infcx.tcx.sess.opts.debug_assertions);
+        // Respect -C overflow-checks.
+        check_overflow |= tcx.sess.overflow_checks();
 
-        // Constants and const fn's always need overflow checks.
+        // Constants always need overflow checks.
         check_overflow |= constness == hir::Constness::Const;
 
         Cx {
-            tcx: infcx.tcx,
-            infcx: infcx,
-            constness: constness,
-            check_overflow: check_overflow,
+            tcx,
+            infcx,
+            root_lint_level: src_id,
+            param_env: tcx.param_env(src_def_id),
+            identity_substs: InternalSubsts::identity_for_item(tcx.global_tcx(), src_def_id),
+            region_scope_tree: tcx.region_scope_tree(src_def_id),
+            tables,
+            constness,
+            body_owner: src_def_id,
+            body_owner_kind,
+            check_overflow,
+            control_flow_destroyed: Vec::new(),
         }
+    }
+
+    pub fn control_flow_destroyed(self) -> Vec<(Span, String)> {
+        self.control_flow_destroyed
     }
 }
 
-impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
-    /// Normalizes `ast` into the appropriate `mirror` type.
+impl<'a, 'tcx> Cx<'a, 'tcx> {
+    /// Normalizes `ast` into the appropriate "mirror" type.
     pub fn mirror<M: Mirror<'tcx>>(&mut self, ast: M) -> M::Output {
         ast.make_mirror(self)
     }
@@ -89,11 +109,8 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
         self.tcx.types.usize
     }
 
-    pub fn usize_literal(&mut self, value: u64) -> Literal<'tcx> {
-        match ConstUsize::new(value, self.tcx.sess.target.uint_type) {
-            Ok(val) => Literal::Value { value: ConstVal::Integral(ConstInt::Usize(val)) },
-            Err(_) => bug!("usize literal out of range for target"),
-        }
+    pub fn usize_literal(&mut self, value: u64) -> &'tcx ty::Const<'tcx> {
+        ty::Const::from_usize(self.tcx, value)
     }
 
     pub fn bool_ty(&mut self) -> Ty<'tcx> {
@@ -101,81 +118,102 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
     }
 
     pub fn unit_ty(&mut self) -> Ty<'tcx> {
-        self.tcx.mk_nil()
+        self.tcx.mk_unit()
     }
 
-    pub fn str_literal(&mut self, value: InternedString) -> Literal<'tcx> {
-        Literal::Value { value: ConstVal::Str(value) }
+    pub fn true_literal(&mut self) -> &'tcx ty::Const<'tcx> {
+        ty::Const::from_bool(self.tcx, true)
     }
 
-    pub fn true_literal(&mut self) -> Literal<'tcx> {
-        Literal::Value { value: ConstVal::Bool(true) }
+    pub fn false_literal(&mut self) -> &'tcx ty::Const<'tcx> {
+        ty::Const::from_bool(self.tcx, false)
     }
 
-    pub fn false_literal(&mut self) -> Literal<'tcx> {
-        Literal::Value { value: ConstVal::Bool(false) }
-    }
+    pub fn const_eval_literal(
+        &mut self,
+        lit: &'tcx ast::LitKind,
+        ty: Ty<'tcx>,
+        sp: Span,
+        neg: bool,
+    ) -> &'tcx ty::Const<'tcx> {
+        trace!("const_eval_literal: {:#?}, {:?}, {:?}, {:?}", lit, ty, sp, neg);
 
-    pub fn const_eval_literal(&mut self, e: &hir::Expr) -> Literal<'tcx> {
-        let tcx = self.tcx.global_tcx();
-        match ConstContext::with_tables(tcx, self.tables()).eval(e, EvalHint::ExprTypeChecked) {
-            Ok(value) => Literal::Value { value: value },
-            Err(s) => fatal_const_eval_err(tcx, &s, e.span, "expression")
+        match lit_to_const(lit, self.tcx, ty, neg) {
+            Ok(c) => c,
+            Err(LitToConstError::UnparseableFloat) => {
+                // FIXME(#31407) this is only necessary because float parsing is buggy
+                self.tcx.sess.span_err(sp, "could not evaluate float literal (see issue #31407)");
+                // create a dummy value and continue compiling
+                Const::from_bits(self.tcx, 0, self.param_env.and(ty))
+            },
+            Err(LitToConstError::Reported) => {
+                // create a dummy value and continue compiling
+                Const::from_bits(self.tcx, 0, self.param_env.and(ty))
+            }
         }
+    }
+
+    pub fn pattern_from_hir(&mut self, p: &hir::Pat) -> Pat<'tcx> {
+        let tcx = self.tcx.global_tcx();
+        let p = match tcx.hir().get(p.hir_id) {
+            Node::Pat(p) | Node::Binding(p) => p,
+            node => bug!("pattern became {:?}", node)
+        };
+        Pat::from_hir(tcx, self.param_env.and(self.identity_substs), self.tables(), p)
     }
 
     pub fn trait_method(&mut self,
                         trait_def_id: DefId,
-                        method_name: &str,
+                        method_name: Symbol,
                         self_ty: Ty<'tcx>,
-                        params: &[Ty<'tcx>])
-                        -> (Ty<'tcx>, Literal<'tcx>) {
-        let method_name = Symbol::intern(method_name);
+                        params: &[GenericArg<'tcx>])
+                        -> &'tcx ty::Const<'tcx> {
         let substs = self.tcx.mk_substs_trait(self_ty, params);
         for item in self.tcx.associated_items(trait_def_id) {
-            if item.kind == ty::AssociatedKind::Method && item.name == method_name {
-                let method_ty = self.tcx.item_type(item.def_id);
+            if item.kind == ty::AssocKind::Method && item.ident.name == method_name {
+                let method_ty = self.tcx.type_of(item.def_id);
                 let method_ty = method_ty.subst(self.tcx, substs);
-                return (method_ty,
-                        Literal::Item {
-                            def_id: item.def_id,
-                            substs: substs,
-                        });
+                return ty::Const::zero_sized(self.tcx, method_ty);
             }
         }
 
         bug!("found no method `{}` in `{:?}`", method_name, trait_def_id);
     }
 
-    pub fn num_variants(&mut self, adt_def: &ty::AdtDef) -> usize {
-        adt_def.variants.len()
-    }
-
-    pub fn all_fields(&mut self, adt_def: &ty::AdtDef, variant_index: usize) -> Vec<Field> {
+    pub fn all_fields(&mut self, adt_def: &ty::AdtDef, variant_index: VariantIdx) -> Vec<Field> {
         (0..adt_def.variants[variant_index].fields.len())
             .map(Field::new)
             .collect()
     }
 
     pub fn needs_drop(&mut self, ty: Ty<'tcx>) -> bool {
-        let ty = self.tcx.lift_to_global(&ty).unwrap_or_else(|| {
-            bug!("MIR: Cx::needs_drop({}) got \
-                  type with inference types/regions",
-                 ty);
-        });
-        self.tcx.type_needs_drop_given_env(ty, &self.infcx.parameter_environment)
+        ty.needs_drop(self.tcx.global_tcx(), self.param_env)
     }
 
-    pub fn tcx(&self) -> TyCtxt<'a, 'gcx, 'tcx> {
+    pub fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
-    pub fn tables(&self) -> &'a ty::Tables<'gcx> {
-        self.infcx.tables.expect_interned()
+    pub fn tables(&self) -> &'a ty::TypeckTables<'tcx> {
+        self.tables
     }
 
     pub fn check_overflow(&self) -> bool {
         self.check_overflow
+    }
+
+    pub fn type_is_copy_modulo_regions(&self, ty: Ty<'tcx>, span: Span) -> bool {
+        self.infcx.type_is_copy_modulo_regions(self.param_env, ty, span)
+    }
+}
+
+impl UserAnnotatedTyHelpers<'tcx> for Cx<'_, 'tcx> {
+    fn tcx(&self) -> TyCtxt<'tcx> {
+        self.tcx()
+    }
+
+    fn tables(&self) -> &ty::TypeckTables<'tcx> {
+        self.tables()
     }
 }
 

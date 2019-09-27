@@ -1,17 +1,7 @@
-// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
-use error::{Error};
-use fmt;
-use sync::atomic::{AtomicBool, Ordering};
-use thread;
+use crate::error::{Error};
+use crate::fmt;
+use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::thread;
 
 pub struct Flag { failed: AtomicBool }
 
@@ -60,17 +50,53 @@ pub struct Guard {
 
 /// A type of error which can be returned whenever a lock is acquired.
 ///
-/// Both Mutexes and RwLocks are poisoned whenever a thread fails while the lock
+/// Both [`Mutex`]es and [`RwLock`]s are poisoned whenever a thread fails while the lock
 /// is held. The precise semantics for when a lock is poisoned is documented on
 /// each lock, but once a lock is poisoned then all future acquisitions will
 /// return this error.
+///
+/// # Examples
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use std::thread;
+///
+/// let mutex = Arc::new(Mutex::new(1));
+///
+/// // poison the mutex
+/// let c_mutex = mutex.clone();
+/// let _ = thread::spawn(move || {
+///     let mut data = c_mutex.lock().unwrap();
+///     *data = 2;
+///     panic!();
+/// }).join();
+///
+/// match mutex.lock() {
+///     Ok(_) => unreachable!(),
+///     Err(p_err) => {
+///         let data = p_err.get_ref();
+///         println!("recovered: {}", data);
+///     }
+/// };
+/// ```
+///
+/// [`Mutex`]: ../../std/sync/struct.Mutex.html
+/// [`RwLock`]: ../../std/sync/struct.RwLock.html
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct PoisonError<T> {
     guard: T,
 }
 
-/// An enumeration of possible errors which can occur while calling the
-/// `try_lock` method.
+/// An enumeration of possible errors associated with a [`TryLockResult`] which
+/// can occur while trying to acquire a lock, from the [`try_lock`] method on a
+/// [`Mutex`] or the [`try_read`] and [`try_write`] methods on an [`RwLock`].
+///
+/// [`Mutex`]: struct.Mutex.html
+/// [`RwLock`]: struct.RwLock.html
+/// [`TryLockResult`]: type.TryLockResult.html
+/// [`try_lock`]: struct.Mutex.html#method.try_lock
+/// [`try_read`]: struct.RwLock.html#method.try_read
+/// [`try_write`]: struct.RwLock.html#method.try_write
 #[stable(feature = "rust1", since = "1.0.0")]
 pub enum TryLockError<T> {
     /// The lock could not be acquired because another thread failed while holding
@@ -85,32 +111,39 @@ pub enum TryLockError<T> {
 
 /// A type alias for the result of a lock method which can be poisoned.
 ///
-/// The `Ok` variant of this result indicates that the primitive was not
-/// poisoned, and the `Guard` is contained within. The `Err` variant indicates
-/// that the primitive was poisoned. Note that the `Err` variant *also* carries
-/// the associated guard, and it can be acquired through the `into_inner`
+/// The [`Ok`] variant of this result indicates that the primitive was not
+/// poisoned, and the `Guard` is contained within. The [`Err`] variant indicates
+/// that the primitive was poisoned. Note that the [`Err`] variant *also* carries
+/// the associated guard, and it can be acquired through the [`into_inner`]
 /// method.
+///
+/// [`Ok`]: ../../std/result/enum.Result.html#variant.Ok
+/// [`Err`]: ../../std/result/enum.Result.html#variant.Err
+/// [`into_inner`]: ../../std/sync/struct.PoisonError.html#method.into_inner
 #[stable(feature = "rust1", since = "1.0.0")]
 pub type LockResult<Guard> = Result<Guard, PoisonError<Guard>>;
 
 /// A type alias for the result of a nonblocking locking method.
 ///
-/// For more information, see `LockResult`. A `TryLockResult` doesn't
-/// necessarily hold the associated guard in the `Err` type as the lock may not
+/// For more information, see [`LockResult`]. A `TryLockResult` doesn't
+/// necessarily hold the associated guard in the [`Err`] type as the lock may not
 /// have been acquired for other reasons.
+///
+/// [`LockResult`]: ../../std/sync/type.LockResult.html
+/// [`Err`]: ../../std/result/enum.Result.html#variant.Err
 #[stable(feature = "rust1", since = "1.0.0")]
 pub type TryLockResult<Guard> = Result<Guard, TryLockError<Guard>>;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> fmt::Debug for PoisonError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "PoisonError { inner: .. }".fmt(f)
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> fmt::Display for PoisonError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "poisoned lock: another task failed inside".fmt(f)
     }
 }
@@ -124,13 +157,40 @@ impl<T> Error for PoisonError<T> {
 
 impl<T> PoisonError<T> {
     /// Creates a `PoisonError`.
+    ///
+    /// This is generally created by methods like [`Mutex::lock`] or [`RwLock::read`].
+    ///
+    /// [`Mutex::lock`]: ../../std/sync/struct.Mutex.html#method.lock
+    /// [`RwLock::read`]: ../../std/sync/struct.RwLock.html#method.read
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn new(guard: T) -> PoisonError<T> {
-        PoisonError { guard: guard }
+        PoisonError { guard }
     }
 
     /// Consumes this error indicating that a lock is poisoned, returning the
     /// underlying guard to allow access regardless.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::collections::HashSet;
+    /// use std::sync::{Arc, Mutex};
+    /// use std::thread;
+    ///
+    /// let mutex = Arc::new(Mutex::new(HashSet::new()));
+    ///
+    /// // poison the mutex
+    /// let c_mutex = mutex.clone();
+    /// let _ = thread::spawn(move || {
+    ///     let mut data = c_mutex.lock().unwrap();
+    ///     data.insert(10);
+    ///     panic!();
+    /// }).join();
+    ///
+    /// let p_err = mutex.lock().unwrap_err();
+    /// let data = p_err.into_inner();
+    /// println!("recovered {} items", data.len());
+    /// ```
     #[stable(feature = "sync_poison", since = "1.2.0")]
     pub fn into_inner(self) -> T { self.guard }
 
@@ -154,7 +214,7 @@ impl<T> From<PoisonError<T>> for TryLockError<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> fmt::Debug for TryLockError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             TryLockError::Poisoned(..) => "Poisoned(..)".fmt(f),
             TryLockError::WouldBlock => "WouldBlock".fmt(f)
@@ -164,7 +224,7 @@ impl<T> fmt::Debug for TryLockError<T> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> fmt::Display for TryLockError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             TryLockError::Poisoned(..) => "poisoned lock: another task failed inside",
             TryLockError::WouldBlock => "try_lock failed because the operation would block"
@@ -181,7 +241,7 @@ impl<T> Error for TryLockError<T> {
         }
     }
 
-    fn cause(&self) -> Option<&Error> {
+    fn cause(&self) -> Option<&dyn Error> {
         match *self {
             TryLockError::Poisoned(ref p) => Some(p),
             _ => None

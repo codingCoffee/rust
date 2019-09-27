@@ -1,45 +1,45 @@
-// Copyright 2013-2014 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+// ignore-tidy-linelength
 
 // ignore-aarch64
+// ignore-gdb // Test temporarily ignored due to debuginfo tests being disabled, see PR 47155
 // min-lldb-version: 310
 
 // compile-flags:-g
 
 // === GDB TESTS ===================================================================================
 
-// gdb-command:print 'c_style_enum::SINGLE_VARIANT'
+// gdbg-command:print 'c_style_enum::SINGLE_VARIANT'
+// gdbr-command:print c_style_enum::SINGLE_VARIANT
 // gdbg-check:$1 = TheOnlyVariant
 // gdbr-check:$1 = c_style_enum::SingleVariant::TheOnlyVariant
 
-// gdb-command:print 'c_style_enum::AUTO_ONE'
+// gdbg-command:print 'c_style_enum::AUTO_ONE'
+// gdbr-command:print c_style_enum::AUTO_ONE
 // gdbg-check:$2 = One
 // gdbr-check:$2 = c_style_enum::AutoDiscriminant::One
 
-// gdb-command:print 'c_style_enum::AUTO_TWO'
+// gdbg-command:print 'c_style_enum::AUTO_TWO'
+// gdbr-command:print c_style_enum::AUTO_TWO
 // gdbg-check:$3 = One
 // gdbr-check:$3 = c_style_enum::AutoDiscriminant::One
 
-// gdb-command:print 'c_style_enum::AUTO_THREE'
+// gdbg-command:print 'c_style_enum::AUTO_THREE'
+// gdbr-command:print c_style_enum::AUTO_THREE
 // gdbg-check:$4 = One
 // gdbr-check:$4 = c_style_enum::AutoDiscriminant::One
 
-// gdb-command:print 'c_style_enum::MANUAL_ONE'
+// gdbg-command:print 'c_style_enum::MANUAL_ONE'
+// gdbr-command:print c_style_enum::MANUAL_ONE
 // gdbg-check:$5 = OneHundred
 // gdbr-check:$5 = c_style_enum::ManualDiscriminant::OneHundred
 
-// gdb-command:print 'c_style_enum::MANUAL_TWO'
+// gdbg-command:print 'c_style_enum::MANUAL_TWO'
+// gdbr-command:print c_style_enum::MANUAL_TWO
 // gdbg-check:$6 = OneHundred
 // gdbr-check:$6 = c_style_enum::ManualDiscriminant::OneHundred
 
-// gdb-command:print 'c_style_enum::MANUAL_THREE'
+// gdbg-command:print 'c_style_enum::MANUAL_THREE'
+// gdbr-command:print c_style_enum::MANUAL_THREE
 // gdbg-check:$7 = OneHundred
 // gdbr-check:$7 = c_style_enum::ManualDiscriminant::OneHundred
 
@@ -99,25 +99,32 @@
 // lldb-command:run
 
 // lldb-command:print auto_one
-// lldb-check:[...]$0 = One
+// lldbg-check:[...]$0 = One
+// lldbr-check:(c_style_enum::AutoDiscriminant) auto_one = c_style_enum::AutoDiscriminant::One
 
 // lldb-command:print auto_two
-// lldb-check:[...]$1 = Two
+// lldbg-check:[...]$1 = Two
+// lldbr-check:(c_style_enum::AutoDiscriminant) auto_two = c_style_enum::AutoDiscriminant::Two
 
 // lldb-command:print auto_three
-// lldb-check:[...]$2 = Three
+// lldbg-check:[...]$2 = Three
+// lldbr-check:(c_style_enum::AutoDiscriminant) auto_three = c_style_enum::AutoDiscriminant::Three
 
 // lldb-command:print manual_one_hundred
-// lldb-check:[...]$3 = OneHundred
+// lldbg-check:[...]$3 = OneHundred
+// lldbr-check:(c_style_enum::ManualDiscriminant) manual_one_hundred = c_style_enum::ManualDiscriminant::OneHundred
 
 // lldb-command:print manual_one_thousand
-// lldb-check:[...]$4 = OneThousand
+// lldbg-check:[...]$4 = OneThousand
+// lldbr-check:(c_style_enum::ManualDiscriminant) manual_one_thousand = c_style_enum::ManualDiscriminant::OneThousand
 
 // lldb-command:print manual_one_million
-// lldb-check:[...]$5 = OneMillion
+// lldbg-check:[...]$5 = OneMillion
+// lldbr-check:(c_style_enum::ManualDiscriminant) manual_one_million = c_style_enum::ManualDiscriminant::OneMillion
 
 // lldb-command:print single_variant
-// lldb-check:[...]$6 = TheOnlyVariant
+// lldbg-check:[...]$6 = TheOnlyVariant
+// lldbr-check:(c_style_enum::SingleVariant) single_variant = c_style_enum::SingleVariant::TheOnlyVariant
 
 #![allow(unused_variables)]
 #![allow(dead_code)]
@@ -143,6 +150,7 @@ enum ManualDiscriminant {
 }
 
 #[derive(Copy, Clone)]
+#[repr(u8)]
 enum SingleVariant {
     TheOnlyVariant
 }

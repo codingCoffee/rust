@@ -1,13 +1,3 @@
-// Copyright 2013 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 //! Constraint solving
 //!
 //! The final phase iterates over the constraints, refining the variance
@@ -15,15 +5,16 @@
 //! optimal solution to the constraints. The final variance for each
 //! inferred is then written into the `variance_map` in the tcx.
 
+use rustc::hir::def_id::DefId;
 use rustc::ty;
-use std::rc::Rc;
+use rustc_data_structures::fx::FxHashMap;
 
 use super::constraints::*;
 use super::terms::*;
 use super::terms::VarianceTerm::*;
 use super::xform::*;
 
-struct SolveContext<'a, 'tcx: 'a> {
+struct SolveContext<'a, 'tcx> {
     terms_cx: TermsContext<'a, 'tcx>,
     constraints: Vec<Constraint<'a>>,
 
@@ -31,21 +22,28 @@ struct SolveContext<'a, 'tcx: 'a> {
     solutions: Vec<ty::Variance>,
 }
 
-pub fn solve_constraints(constraints_cx: ConstraintContext) {
+pub fn solve_constraints<'tcx>(
+    constraints_cx: ConstraintContext<'_, 'tcx>
+) -> ty::CrateVariancesMap<'tcx> {
     let ConstraintContext { terms_cx, constraints, .. } = constraints_cx;
 
-    let solutions = terms_cx.inferred_infos
-        .iter()
-        .map(|ii| ii.initial_variance)
-        .collect();
+    let mut solutions = vec![ty::Bivariant; terms_cx.inferred_terms.len()];
+    for &(id, ref variances) in &terms_cx.lang_items {
+        let InferredIndex(start) = terms_cx.inferred_starts[&id];
+        for (i, &variance) in variances.iter().enumerate() {
+            solutions[start + i] = variance;
+        }
+    }
 
     let mut solutions_cx = SolveContext {
-        terms_cx: terms_cx,
-        constraints: constraints,
-        solutions: solutions,
+        terms_cx,
+        constraints,
+        solutions,
     };
     solutions_cx.solve();
-    solutions_cx.write();
+    let variances = solutions_cx.create_map();
+
+    ty::CrateVariancesMap { variances }
 }
 
 impl<'a, 'tcx> SolveContext<'a, 'tcx> {
@@ -66,12 +64,9 @@ impl<'a, 'tcx> SolveContext<'a, 'tcx> {
                 let old_value = self.solutions[inferred];
                 let new_value = glb(variance, old_value);
                 if old_value != new_value {
-                    debug!("Updating inferred {} (node {}) \
+                    debug!("updating inferred {} \
                             from {:?} to {:?} due to {:?}",
                            inferred,
-                           self.terms_cx
-                                   .inferred_infos[inferred]
-                               .param_id,
                            old_value,
                            new_value,
                            term);
@@ -83,66 +78,47 @@ impl<'a, 'tcx> SolveContext<'a, 'tcx> {
         }
     }
 
-    fn write(&self) {
-        // Collect all the variances for a particular item and stick
-        // them into the variance map. We rely on the fact that we
-        // generate all the inferreds for a particular item
-        // consecutively (that is, we collect solutions for an item
-        // until we see a new item id, and we assume (1) the solutions
-        // are in the same order as the type parameters were declared
-        // and (2) all solutions or a given item appear before a new
-        // item id).
-
+    fn enforce_const_invariance(&self, generics: &ty::Generics, variances: &mut [ty::Variance]) {
         let tcx = self.terms_cx.tcx;
 
-        // Ignore the writes here because the relevant edges were
-        // already accounted for in `constraints.rs`. See the section
-        // on dependency graph management in README.md for more
-        // information.
-        let _ignore = tcx.dep_graph.in_ignore();
+        // Make all const parameters invariant.
+        for param in generics.params.iter() {
+            if let ty::GenericParamDefKind::Const = param.kind {
+                variances[param.index as usize] = ty::Invariant;
+            }
+        }
+
+        // Make all the const parameters in the parent invariant (recursively).
+        if let Some(def_id) = generics.parent {
+            self.enforce_const_invariance(tcx.generics_of(def_id), variances);
+        }
+    }
+
+    fn create_map(&self) -> FxHashMap<DefId, &'tcx [ty::Variance]> {
+        let tcx = self.terms_cx.tcx;
 
         let solutions = &self.solutions;
-        let inferred_infos = &self.terms_cx.inferred_infos;
-        let mut index = 0;
-        let num_inferred = self.terms_cx.num_inferred();
-        while index < num_inferred {
-            let item_id = inferred_infos[index].item_id;
+        self.terms_cx.inferred_starts.iter().map(|(&id, &InferredIndex(start))| {
+            let def_id = tcx.hir().local_def_id(id);
+            let generics = tcx.generics_of(def_id);
+            let count = generics.count();
 
-            let mut item_variances = vec![];
+            let variances = tcx.arena.alloc_slice(&solutions[start..(start + count)]);
 
-            while index < num_inferred && inferred_infos[index].item_id == item_id {
-                let info = &inferred_infos[index];
-                let variance = solutions[index];
-                debug!("Index {} Info {} Variance {:?}",
-                       index,
-                       info.index,
-                       variance);
+            // Const parameters are always invariant.
+            self.enforce_const_invariance(generics, variances);
 
-                assert_eq!(item_variances.len(), info.index);
-                item_variances.push(variance);
-                index += 1;
+            // Functions are permitted to have unused generic parameters: make those invariant.
+            if let ty::FnDef(..) = tcx.type_of(def_id).kind {
+                for variance in variances.iter_mut() {
+                    if *variance == ty::Bivariant {
+                        *variance = ty::Invariant;
+                    }
+                }
             }
 
-            debug!("item_id={} item_variances={:?}", item_id, item_variances);
-
-            let item_def_id = tcx.map.local_def_id(item_id);
-
-            // For unit testing: check for a special "rustc_variance"
-            // attribute and report an error with various results if found.
-            if tcx.has_attr(item_def_id, "rustc_variance") {
-                span_err!(tcx.sess,
-                          tcx.map.span(item_id),
-                          E0208,
-                          "{:?}",
-                          item_variances);
-            }
-
-            let newly_added = tcx.item_variance_map
-                .borrow_mut()
-                .insert(item_def_id, Rc::new(item_variances))
-                .is_none();
-            assert!(newly_added);
-        }
+            (def_id, &*variances)
+        }).collect()
     }
 
     fn evaluate(&self, term: VarianceTermPtr<'a>) -> ty::Variance {

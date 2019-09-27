@@ -1,13 +1,3 @@
-// Copyright 2013 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
-
 // Representing terms
 //
 // Terms are structured as a straightforward tree. Rather than rely on
@@ -20,15 +10,11 @@
 // a variable.
 
 use arena::TypedArena;
-use dep_graph::DepTrackingMapConfig;
 use rustc::ty::{self, TyCtxt};
-use rustc::ty::maps::ItemVariances;
 use std::fmt;
-use std::rc::Rc;
-use syntax::ast;
 use rustc::hir;
 use rustc::hir::itemlikevisit::ItemLikeVisitor;
-use util::nodemap::NodeMap;
+use crate::util::nodemap::HirIdMap;
 
 use self::VarianceTerm::*;
 
@@ -45,7 +31,7 @@ pub enum VarianceTerm<'a> {
 }
 
 impl<'a> fmt::Debug for VarianceTerm<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ConstantTerm(c1) => write!(f, "{:?}", c1),
             TransformTerm(v1, v2) => write!(f, "({:?} \u{00D7} {:?})", v1, v2),
@@ -61,206 +47,135 @@ impl<'a> fmt::Debug for VarianceTerm<'a> {
 
 // The first pass over the crate simply builds up the set of inferreds.
 
-pub struct TermsContext<'a, 'tcx: 'a> {
-    pub tcx: TyCtxt<'a, 'tcx, 'tcx>,
+pub struct TermsContext<'a, 'tcx> {
+    pub tcx: TyCtxt<'tcx>,
     pub arena: &'a TypedArena<VarianceTerm<'a>>,
-
-    pub empty_variances: Rc<Vec<ty::Variance>>,
 
     // For marker types, UnsafeCell, and other lang items where
     // variance is hardcoded, records the item-id and the hardcoded
     // variance.
-    pub lang_items: Vec<(ast::NodeId, Vec<ty::Variance>)>,
+    pub lang_items: Vec<(hir::HirId, Vec<ty::Variance>)>,
 
-    // Maps from the node id of a type/generic parameter to the
-    // corresponding inferred index.
-    pub inferred_map: NodeMap<InferredIndex>,
+    // Maps from the node id of an item to the first inferred index
+    // used for its type & region parameters.
+    pub inferred_starts: HirIdMap<InferredIndex>,
 
-    // Maps from an InferredIndex to the info for that variable.
-    pub inferred_infos: Vec<InferredInfo<'a>>,
+    // Maps from an InferredIndex to the term for that variable.
+    pub inferred_terms: Vec<VarianceTermPtr<'a>>,
 }
 
-pub struct InferredInfo<'a> {
-    pub item_id: ast::NodeId,
-    pub index: usize,
-    pub param_id: ast::NodeId,
-    pub term: VarianceTermPtr<'a>,
-
-    // Initial value to use for this parameter when inferring
-    // variance. For most parameters, this is Bivariant. But for lang
-    // items and input type parameters on traits, it is different.
-    pub initial_variance: ty::Variance,
-}
-
-pub fn determine_parameters_to_be_inferred<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                                     arena: &'a mut TypedArena<VarianceTerm<'a>>)
-                                                     -> TermsContext<'a, 'tcx> {
+pub fn determine_parameters_to_be_inferred<'a, 'tcx>(
+    tcx: TyCtxt<'tcx>,
+    arena: &'a mut TypedArena<VarianceTerm<'a>>,
+) -> TermsContext<'a, 'tcx> {
     let mut terms_cx = TermsContext {
-        tcx: tcx,
-        arena: arena,
-        inferred_map: NodeMap(),
-        inferred_infos: Vec::new(),
+        tcx,
+        arena,
+        inferred_starts: Default::default(),
+        inferred_terms: vec![],
 
         lang_items: lang_items(tcx),
-
-        // cache and share the variance struct used for items with
-        // no type/region parameters
-        empty_variances: Rc::new(vec![]),
     };
 
-    // See README.md for a discussion on dep-graph management.
-    tcx.visit_all_item_likes_in_krate(|def_id| ItemVariances::to_dep_node(&def_id), &mut terms_cx);
+    // See the following for a discussion on dep-graph management.
+    //
+    // - https://rust-lang.github.io/rustc-guide/query.html
+    // - https://rust-lang.github.io/rustc-guide/variance.html
+    tcx.hir().krate().visit_all_item_likes(&mut terms_cx);
 
     terms_cx
 }
 
-fn lang_items(tcx: TyCtxt) -> Vec<(ast::NodeId, Vec<ty::Variance>)> {
+fn lang_items(tcx: TyCtxt<'_>) -> Vec<(hir::HirId, Vec<ty::Variance>)> {
+    let lang_items = tcx.lang_items();
     let all = vec![
-        (tcx.lang_items.phantom_data(), vec![ty::Covariant]),
-        (tcx.lang_items.unsafe_cell_type(), vec![ty::Invariant]),
-
-        // Deprecated:
-        (tcx.lang_items.covariant_type(), vec![ty::Covariant]),
-        (tcx.lang_items.contravariant_type(), vec![ty::Contravariant]),
-        (tcx.lang_items.invariant_type(), vec![ty::Invariant]),
-        (tcx.lang_items.covariant_lifetime(), vec![ty::Covariant]),
-        (tcx.lang_items.contravariant_lifetime(), vec![ty::Contravariant]),
-        (tcx.lang_items.invariant_lifetime(), vec![ty::Invariant]),
-
+        (lang_items.phantom_data(), vec![ty::Covariant]),
+        (lang_items.unsafe_cell_type(), vec![ty::Invariant]),
         ];
 
     all.into_iter() // iterating over (Option<DefId>, Variance)
        .filter(|&(ref d,_)| d.is_some())
        .map(|(d, v)| (d.unwrap(), v)) // (DefId, Variance)
-       .filter_map(|(d, v)| tcx.map.as_local_node_id(d).map(|n| (n, v))) // (NodeId, Variance)
+       .filter_map(|(d, v)| tcx.hir().as_local_hir_id(d).map(|n| (n, v))) // (HirId, Variance)
        .collect()
 }
 
 impl<'a, 'tcx> TermsContext<'a, 'tcx> {
-    fn add_inferreds_for_item(&mut self,
-                              item_id: ast::NodeId,
-                              has_self: bool,
-                              generics: &hir::Generics) {
-        //! Add "inferreds" for the generic parameters declared on this
-        //! item. This has a lot of annoying parameters because we are
-        //! trying to drive this from the AST, rather than the
-        //! ty::Generics, so that we can get span info -- but this
-        //! means we must accommodate syntactic distinctions.
-        //!
+    fn add_inferreds_for_item(&mut self, id: hir::HirId) {
+        let tcx = self.tcx;
+        let def_id = tcx.hir().local_def_id(id);
+        let count = tcx.generics_of(def_id).count();
 
-        // NB: In the code below for writing the results back into the
-        // tcx, we rely on the fact that all inferreds for a particular
-        // item are assigned continuous indices.
-
-        let inferreds_on_entry = self.num_inferred();
-
-        if has_self {
-            self.add_inferred(item_id, 0, item_id);
+        if count == 0 {
+            return;
         }
 
-        for (i, p) in generics.lifetimes.iter().enumerate() {
-            let id = p.lifetime.id;
-            let i = has_self as usize + i;
-            self.add_inferred(item_id, i, id);
-        }
-
-        for (i, p) in generics.ty_params.iter().enumerate() {
-            let i = has_self as usize + generics.lifetimes.len() + i;
-            self.add_inferred(item_id, i, p.id);
-        }
-
-        // If this item has no type or lifetime parameters,
-        // then there are no variances to infer, so just
-        // insert an empty entry into the variance map.
-        // Arguably we could just leave the map empty in this
-        // case but it seems cleaner to be able to distinguish
-        // "invalid item id" from "item id with no
-        // parameters".
-        if self.num_inferred() == inferreds_on_entry {
-            let item_def_id = self.tcx.map.local_def_id(item_id);
-            let newly_added = self.tcx
-                .item_variance_map
-                .borrow_mut()
-                .insert(item_def_id, self.empty_variances.clone())
-                .is_none();
-            assert!(newly_added);
-        }
-    }
-
-    fn add_inferred(&mut self, item_id: ast::NodeId, index: usize, param_id: ast::NodeId) {
-        let inf_index = InferredIndex(self.inferred_infos.len());
-        let term = self.arena.alloc(InferredTerm(inf_index));
-        let initial_variance = self.pick_initial_variance(item_id, index);
-        self.inferred_infos.push(InferredInfo {
-            item_id: item_id,
-            index: index,
-            param_id: param_id,
-            term: term,
-            initial_variance: initial_variance,
-        });
-        let newly_added = self.inferred_map.insert(param_id, inf_index).is_none();
+        // Record the start of this item's inferreds.
+        let start = self.inferred_terms.len();
+        let newly_added = self.inferred_starts.insert(id, InferredIndex(start)).is_none();
         assert!(newly_added);
 
-        debug!("add_inferred(item_path={}, \
-                item_id={}, \
-                index={}, \
-                param_id={}, \
-                inf_index={:?}, \
-                initial_variance={:?})",
-               self.tcx.item_path_str(self.tcx.map.local_def_id(item_id)),
-               item_id,
-               index,
-               param_id,
-               inf_index,
-               initial_variance);
-    }
+        // N.B., in the code below for writing the results back into the
+        // `CrateVariancesMap`, we rely on the fact that all inferreds
+        // for a particular item are assigned continuous indices.
 
-    fn pick_initial_variance(&self, item_id: ast::NodeId, index: usize) -> ty::Variance {
-        match self.lang_items.iter().find(|&&(n, _)| n == item_id) {
-            Some(&(_, ref variances)) => variances[index],
-            None => ty::Bivariant,
-        }
-    }
-
-    pub fn num_inferred(&self) -> usize {
-        self.inferred_infos.len()
+        let arena = self.arena;
+        self.inferred_terms.extend((start..(start + count)).map(|i| {
+            &*arena.alloc(InferredTerm(InferredIndex(i)))
+        }));
     }
 }
 
 impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for TermsContext<'a, 'tcx> {
     fn visit_item(&mut self, item: &hir::Item) {
         debug!("add_inferreds for item {}",
-               self.tcx.map.node_to_string(item.id));
+               self.tcx.hir().node_to_string(item.hir_id));
 
-        match item.node {
-            hir::ItemEnum(_, ref generics) |
-            hir::ItemStruct(_, ref generics) |
-            hir::ItemUnion(_, ref generics) => {
-                self.add_inferreds_for_item(item.id, false, generics);
-            }
-            hir::ItemTrait(_, ref generics, ..) => {
-                // Note: all inputs for traits are ultimately
-                // constrained to be invariant. See `visit_item` in
-                // the impl for `ConstraintContext` in `constraints.rs`.
-                self.add_inferreds_for_item(item.id, true, generics);
+        match item.kind {
+            hir::ItemKind::Struct(ref struct_def, _) |
+            hir::ItemKind::Union(ref struct_def, _) => {
+                self.add_inferreds_for_item(item.hir_id);
+
+                if let hir::VariantData::Tuple(..) = *struct_def {
+                    self.add_inferreds_for_item(struct_def.ctor_hir_id().unwrap());
+                }
             }
 
-            hir::ItemExternCrate(_) |
-            hir::ItemUse(..) |
-            hir::ItemDefaultImpl(..) |
-            hir::ItemImpl(..) |
-            hir::ItemStatic(..) |
-            hir::ItemConst(..) |
-            hir::ItemFn(..) |
-            hir::ItemMod(..) |
-            hir::ItemForeignMod(..) |
-            hir::ItemTy(..) => {}
+            hir::ItemKind::Enum(ref enum_def, _) => {
+                self.add_inferreds_for_item(item.hir_id);
+
+                for variant in &enum_def.variants {
+                    if let hir::VariantData::Tuple(..) = variant.data {
+                        self.add_inferreds_for_item(variant.data.ctor_hir_id().unwrap());
+                    }
+                }
+            }
+
+            hir::ItemKind::Fn(..) => {
+                self.add_inferreds_for_item(item.hir_id);
+            }
+
+            hir::ItemKind::ForeignMod(ref foreign_mod) => {
+                for foreign_item in &foreign_mod.items {
+                    if let hir::ForeignItemKind::Fn(..) = foreign_item.kind {
+                        self.add_inferreds_for_item(foreign_item.hir_id);
+                    }
+                }
+            }
+
+            _ => {}
         }
     }
 
-    fn visit_trait_item(&mut self, _trait_item: &hir::TraitItem) {
+    fn visit_trait_item(&mut self, trait_item: &hir::TraitItem) {
+        if let hir::TraitItemKind::Method(..) = trait_item.kind {
+            self.add_inferreds_for_item(trait_item.hir_id);
+        }
     }
 
-    fn visit_impl_item(&mut self, _impl_item: &hir::ImplItem) {
+    fn visit_impl_item(&mut self, impl_item: &hir::ImplItem) {
+        if let hir::ImplItemKind::Method(..) = impl_item.kind {
+            self.add_inferreds_for_item(impl_item.hir_id);
+        }
     }
 }
