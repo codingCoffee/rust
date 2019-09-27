@@ -17,57 +17,8 @@ use syntax::parse::token::{self, Token};
 use syntax::parse;
 use syntax::symbol::{kw, sym};
 use syntax_pos::{Span, FileName};
-
-/// Highlights `src`, returning the HTML output.
-pub fn render_with_highlighting(
-    src: &str,
-    class: Option<&str>,
-    extension: Option<&str>,
-    tooltip: Option<(&str, &str)>,
-) -> String {
-    debug!("highlighting: ================\n{}\n==============", src);
-    let mut out = Vec::new();
-    if let Some((tooltip, class)) = tooltip {
-        write!(out, "<div class='information'><div class='tooltip {}'>ⓘ<span \
-                     class='tooltiptext'>{}</span></div></div>",
-               class, tooltip).unwrap();
-    }
-
-    let sess = parse::ParseSess::new(FilePathMapping::empty());
-    let fm = sess.source_map().new_source_file(
-        FileName::Custom(String::from("rustdoc-highlighting")),
-        src.to_owned(),
-    );
-    let highlight_result = {
-        let lexer = lexer::StringReader::new(&sess, fm, None);
-        let mut classifier = Classifier::new(lexer, sess.source_map());
-
-        let mut highlighted_source = vec![];
-        if classifier.write_source(&mut highlighted_source).is_err() {
-            Err(())
-        } else {
-            Ok(String::from_utf8_lossy(&highlighted_source).into_owned())
-        }
-    };
-
-    match highlight_result {
-        Ok(highlighted_source) => {
-            write_header(class, &mut out).unwrap();
-            write!(out, "{}", highlighted_source).unwrap();
-            if let Some(extension) = extension {
-                write!(out, "{}", extension).unwrap();
-            }
-            write_footer(&mut out).unwrap();
-        }
-        Err(()) => {
-            // If errors are encountered while trying to highlight, just emit
-            // the unhighlighted source.
-            write!(out, "<pre><code>{}</code></pre>", src).unwrap();
-        }
-    }
-
-    String::from_utf8_lossy(&out[..]).into_owned()
-}
+use term::{color, Terminal, stdout, Attr};
+use term::Attr::{ForegroundColor, Bold, Dim, Underline};
 
 /// Processes a program (nested in the internal `lexer`), classifying strings of
 /// text by highlighting category (`Class`). Calls out to a `Writer` to write
@@ -212,7 +163,7 @@ impl<'a> Classifier<'a> {
     /// is used. All source code emission is done as slices from the source map,
     /// not from the tokens themselves, in order to stay true to the original
     /// source.
-    fn write_source<W: Writer>(&mut self,
+    fn write_source<W: Writer + Write>(&mut self,
                                    out: &mut W)
                                    -> Result<(), HighlightError> {
         loop {
@@ -228,13 +179,13 @@ impl<'a> Classifier<'a> {
     }
 
     // Handles an individual token from the lexer.
-    fn write_token<W: Writer>(&mut self,
+    fn write_token<W: Writer + Write>(&mut self,
                               out: &mut W,
                               token: Token)
                               -> Result<(), HighlightError> {
         let klass = match token.kind {
             token::Shebang(s) => {
-                out.string(Escape(&s.as_str()), Class::None)?;
+                out.string(&s.as_str(), Class::None)?;
                 return Ok(());
             },
 
@@ -371,7 +322,7 @@ impl<'a> Classifier<'a> {
 
         // Anything that didn't return above is the simple case where we the
         // class just spans a single token, so we can use the `string` method.
-        out.string(Escape(&self.snip(token.span)), klass)?;
+        out.string(&self.snip(token.span), klass)?;
 
         Ok(())
     }
@@ -406,12 +357,140 @@ impl Class {
             Class::QuestionMark => "question-mark"
         }
     }
+
+    pub fn term_style(self) -> Vec<Attr> {
+        match self {
+            Class::None => vec![],
+            Class::Comment => vec![ForegroundColor(color::GREEN)],
+            Class::DocComment => vec![ForegroundColor(color::MAGENTA)],
+            Class::Attribute => vec![Bold],
+            Class::KeyWord => vec![Dim, ForegroundColor(color::YELLOW)],
+            Class::RefKeyWord => vec![Dim, ForegroundColor(color::MAGENTA)],
+            Class::Self_ => vec![ForegroundColor(color::CYAN)],
+            Class::Op => vec![ForegroundColor(color::YELLOW)],
+            Class::Macro => vec![ForegroundColor(color::MAGENTA)],
+            Class::MacroNonTerminal => vec![ForegroundColor(color::MAGENTA), Bold],
+            Class::String => vec![Underline(true)],
+            Class::Number => vec![ForegroundColor(color::CYAN)],
+            Class::Bool => vec![ForegroundColor(color::CYAN)],
+            Class::Ident => vec![],
+            Class::Lifetime => vec![Dim, ForegroundColor(color::MAGENTA)],
+            Class::PreludeTy => vec![ForegroundColor(color::GREEN)],
+            Class::PreludeVal => vec![ForegroundColor(color::CYAN)],
+            Class::QuestionMark => vec![Bold, ForegroundColor(color::GREEN)],
+        }
+    }
 }
 
-fn write_header(class: Option<&str>, out: &mut dyn Write) -> io::Result<()> {
-    write!(out, "<div class=\"example-wrap\"><pre class=\"rust {}\">\n", class.unwrap_or(""))
+// You can implement `Writer` for anthing that can be written to, this just implements
+// the default rustdoc behaviour for HTML output.
+impl Writer for Vec<u8> {
+    fn string<T: Display>(&mut self,
+                          text: T,
+                          klass: Class,
+                          _tas: Option<&TokenAndSpan>)
+                          -> io::Result<()> {
+        match klass {
+            Class::None => write!(self, "{}", text),
+            klass => write!(self,
+                            "<span class='{}'>{}</span>",
+                            klass.rustdoc_class(),
+                            Escape(&format!("{}", text))),
+        }
+    }
+
+    fn enter_span(&mut self, klass: Class) -> io::Result<()> {
+        write!(self, "<span class='{}'>", klass.rustdoc_class())
+    }
+
+    fn exit_span(&mut self) -> io::Result<()> {
+        write!(self, "</span>")
+    }
 }
 
-fn write_footer(out: &mut dyn Write) -> io::Result<()> {
-    write!(out, "</pre></div>\n")
+// This implements behaviour for terminal output.
+impl Writer for Box<Terminal<Output=io::Stdout> + Send> {
+    fn string<T: Display>(&mut self,
+                          text: T,
+                          klass: Class,
+                          _tas: Option<&TokenAndSpan>)
+                          -> io::Result<()> {
+        for attr in klass.term_style() {
+            self.attr(attr)?;
+        }
+        write!(self, "{}", text)?;
+        let _ = self.reset();
+        Ok(())
+    }
+
+    fn enter_span(&mut self, klass: Class) -> io::Result<()> {
+        for attr in klass.term_style() {
+            self.attr(attr)?;
+        }
+        Ok(())
+    }
+
+    fn exit_span(&mut self) -> io::Result<()> {
+        let _ = self.reset();
+        Ok(())
+    }
+}
+
+fn render_maybe_with_highlighting(src: String, class: Option<&str>, id: Option<&str>,
+                                  extension: Option<&str>, enclose: bool) -> io::Result<String> {
+    debug!("html highlighting: ================\n{}\n==============", src);
+    let mut out = Vec::new();
+
+    if enclose {
+        write!(out, "<pre ")?;
+        if let Some(id) = id {
+            write!(out, "id='{}' ", id)?;
+        }
+        write!(out, "class='rust {}'>\n", class.unwrap_or(""))?;
+    }
+
+    let sess = parse::ParseSess::new();
+    let fm = sess.codemap().new_filemap("<stdin>".to_string(), None, src);
+    let mut classifier = Classifier::new(lexer::StringReader::new(&sess, fm), sess.codemap());
+    classifier.write_source(&mut out)?;
+
+    if let Some(extension) = extension {
+        write!(out, "{}", extension)?;
+    }
+
+    if enclose {
+        write!(out, "</pre>\n")?;
+    }
+
+    Ok(String::from_utf8_lossy(&out[..]).to_string())
+}
+
+/// Highlights `src`, returning the HTML output. Returns only the inner html to
+/// be inserted into an element. C.f., `render_with_highlighting` which includes
+/// an enclosing `<pre>` block.
+pub fn render_inner_with_highlighting(src: &str) -> io::Result<String> {
+    render_maybe_with_highlighting(src.to_string(), None, None, None, false)
+}
+
+/// Highlights `src`, returning the HTML output.
+pub fn render_with_highlighting(src: &str,
+                                class: Option<&str>,
+                                id: Option<&str>,
+                                extension: Option<&str>)
+                                -> String {
+    match render_maybe_with_highlighting(src.to_string(), class, id, extension, true) {
+        Ok(s) => s,
+        Err(_) => src.to_string(),
+    }
+}
+
+/// Highlights `src` and prints it out to stderr.
+pub fn render_to_stdout_with_highlighting(src: String) {
+    debug!("term highlighting: ================\n{}\n==============", src);
+    let mut t = stdout().unwrap();
+
+    let sess = parse::ParseSess::new();
+    let fm = sess.codemap().new_filemap("<stdin>".to_string(), None, src);
+    let mut classifier = Classifier::new(lexer::StringReader::new(&sess, fm), sess.codemap());
+    let _ = classifier.write_source(&mut t);
 }

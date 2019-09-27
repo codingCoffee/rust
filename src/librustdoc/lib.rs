@@ -18,6 +18,7 @@
 #![feature(never_type)]
 #![feature(mem_take)]
 #![feature(unicode_internals)]
+#![feature(rustc_highlight)]
 
 #![recursion_limit="256"]
 
@@ -33,6 +34,7 @@ extern crate rustc_metadata;
 extern crate rustc_target;
 extern crate rustc_typeck;
 extern crate rustc_lexer;
+extern crate rustc_highlight;
 extern crate serialize;
 extern crate syntax;
 extern crate syntax_pos;

@@ -3429,6 +3429,7 @@ dependencies = [
  "rustc_codegen_utils",
  "rustc_data_structures",
  "rustc_errors",
+ "rustc_highlight",
  "rustc_interface",
  "rustc_metadata",
  "rustc_mir",
@@ -3459,6 +3460,15 @@ dependencies = [
 [[package]]
 name = "rustc_fs_util"
 version = "0.0.0"
+
+[[package]]
+name = "rustc_highlight"
+version = "0.0.0"
+dependencies = [
+ "log",
+ "syntax",
+ "syntax_pos",
+]
 
 [[package]]
 name = "rustc_incremental"

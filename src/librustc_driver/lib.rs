@@ -12,6 +12,7 @@
 #![feature(set_stdio)]
 #![feature(no_debug)]
 #![feature(integer_atomics)]
+#![feature(rustc_highlight)]
 
 #![recursion_limit="256"]
 
@@ -41,6 +42,7 @@ use rustc::ty::TyCtxt;
 use rustc::util::common::{set_time_depth, time, print_time_passes_entry, ErrorReported};
 use rustc_metadata::locator;
 use rustc_metadata::cstore::CStore;
+use rustc_highlight::highlight::render_to_stdout_with_highlighting;
 use rustc_codegen_utils::codegen_backend::CodegenBackend;
 use rustc_interface::interface;
 use rustc_interface::util::get_codegen_sysroot;
@@ -526,6 +528,48 @@ fn stdout_isatty() -> bool {
         GetConsoleMode(handle, &mut out) != 0
     }
 }
+
+// CompilerCalls instance for a regular rustc build.
+#[derive(Copy, Clone)]
+pub struct RustcDefaultCalls;
+
+fn print_msg(text: &str) {
+    let mut code = String::new();
+    let mut in_code = false;
+    let mut code_is_rust = false;
+    for (i, line) in text.split('\n').enumerate() {
+        // Slice off the leading newline and print.
+        if i == 0 && line.len() == 0 {
+            continue;
+        }
+        if line.starts_with("```") {
+            if in_code {
+                if code_is_rust {
+                    println!("rust");
+                    render_to_stdout_with_highlighting(code);
+                } else {
+                    render_to_stdout_with_highlighting(code);
+                }
+                code = String::new();
+                code_is_rust = false;
+            } else {
+                if line.starts_with("```rust") {
+                    code_is_rust = true;
+                }
+            }
+            in_code = !in_code;
+            println!("```");
+        } else {
+            if in_code {
+                code.push_str(&line);
+                code.push_str("\n");
+            } else {
+                println!("{}", line);
+            }
+        }
+    }
+}
+
 
 fn handle_explain(code: &str,
                   output: ErrorOutputType) {
