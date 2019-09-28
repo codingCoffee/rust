@@ -11,8 +11,8 @@
 #![feature(rustc_private)]
 #![feature(staged_api)]
 
-#[macro_use] extern crate syntax;
-extern crate syntax_pos;
+//cc; #[macro_use] extern crate syntax;
+//cc; extern crate syntax_pos;
 #[macro_use] extern crate log;
 extern crate term;
 

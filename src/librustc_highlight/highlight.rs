@@ -5,7 +5,7 @@
 //!
 //! Use the `render_with_highlighting` to highlight some rust code.
 
-use crate::html::escape::Escape;
+//cc; use crate::html::escape::Escape;
 
 use std::fmt::Display;
 use std::io;
@@ -19,6 +19,7 @@ use syntax::symbol::{kw, sym};
 use syntax_pos::{Span, FileName};
 use term::{color, Terminal, stdout, Attr};
 use term::Attr::{ForegroundColor, Bold, Dim, Underline};
+use crate::escape::Escape;
 
 /// Processes a program (nested in the internal `lexer`), classifying strings of
 /// text by highlighting category (`Class`). Calls out to a `Writer` to write
@@ -86,28 +87,6 @@ trait Writer {
                           text: T,
                           klass: Class)
                           -> io::Result<()>;
-}
-
-// Implement `Writer` for anthing that can be written to, this just implements
-// the default rustdoc behaviour.
-impl<U: Write> Writer for U {
-    fn string<T: Display>(&mut self,
-                          text: T,
-                          klass: Class)
-                          -> io::Result<()> {
-        match klass {
-            Class::None => write!(self, "{}", text),
-            klass => write!(self, "<span class=\"{}\">{}</span>", klass.rustdoc_class(), text),
-        }
-    }
-
-    fn enter_span(&mut self, klass: Class) -> io::Result<()> {
-        write!(self, "<span class=\"{}\">", klass.rustdoc_class())
-    }
-
-    fn exit_span(&mut self) -> io::Result<()> {
-        write!(self, "</span>")
-    }
 }
 
 enum HighlightError {
@@ -387,8 +366,7 @@ impl Class {
 impl Writer for Vec<u8> {
     fn string<T: Display>(&mut self,
                           text: T,
-                          klass: Class,
-                          _tas: Option<&TokenAndSpan>)
+                          klass: Class)
                           -> io::Result<()> {
         match klass {
             Class::None => write!(self, "{}", text),
@@ -409,11 +387,10 @@ impl Writer for Vec<u8> {
 }
 
 // This implements behaviour for terminal output.
-impl Writer for Box<Terminal<Output=io::Stdout> + Send> {
+impl Writer for Box<dyn Terminal<Output=io::Stdout> + Send> {
     fn string<T: Display>(&mut self,
                           text: T,
-                          klass: Class,
-                          _tas: Option<&TokenAndSpan>)
+                          klass: Class)
                           -> io::Result<()> {
         for attr in klass.term_style() {
             self.attr(attr)?;
@@ -449,20 +426,24 @@ fn render_maybe_with_highlighting(src: String, class: Option<&str>, id: Option<&
         write!(out, "class='rust {}'>\n", class.unwrap_or(""))?;
     }
 
-    let sess = parse::ParseSess::new();
-    let fm = sess.codemap().new_filemap("<stdin>".to_string(), None, src);
-    let mut classifier = Classifier::new(lexer::StringReader::new(&sess, fm), sess.codemap());
-    classifier.write_source(&mut out)?;
+    let sess = parse::ParseSess::new(FilePathMapping::empty());
+    let fm = sess.source_map().new_source_file(FileName::Custom("<stdin>".to_string()), src);
+    let lexer = lexer::StringReader::new(&sess, fm, None);
+    let mut classifier = Classifier::new(lexer, sess.source_map());
 
-    if let Some(extension) = extension {
-        write!(out, "{}", extension)?;
+    if classifier.write_source(&mut out).is_err() {
+        if let Some(extension) = extension {
+            write!(out, "{}", extension)?;
+            //Ok(String::from_utf8_lossy(&out[..]).to_string())
+        }
+
+        if enclose {
+            write!(out, "</pre>\n")?;
+            // Ok(String::from_utf8_lossy(&out[..]).to_string())
+        }
+    } else {
+        Ok(String::from_utf8_lossy(&out[..]).to_string())
     }
-
-    if enclose {
-        write!(out, "</pre>\n")?;
-    }
-
-    Ok(String::from_utf8_lossy(&out[..]).to_string())
 }
 
 /// Highlights `src`, returning the HTML output. Returns only the inner html to
@@ -489,8 +470,9 @@ pub fn render_to_stdout_with_highlighting(src: String) {
     debug!("term highlighting: ================\n{}\n==============", src);
     let mut t = stdout().unwrap();
 
-    let sess = parse::ParseSess::new();
-    let fm = sess.codemap().new_filemap("<stdin>".to_string(), None, src);
-    let mut classifier = Classifier::new(lexer::StringReader::new(&sess, fm), sess.codemap());
+    let sess = parse::ParseSess::new(FilePathMapping::empty());
+    let fm = sess.source_map().new_source_file(FileName::Custom("<stdin>".to_string()), src);
+    let lexer = lexer::StringReader::new(&sess, fm, None);
+    let mut classifier = Classifier::new(lexer, sess.source_map());
     let _ = classifier.write_source(&mut t);
 }
